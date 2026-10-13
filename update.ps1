@@ -135,7 +135,8 @@ $state=Join-Path $dir 'tg-state.txt'
 $prev=@{};$first=-not(Test-Path $state)
 if(-not $first){ foreach($l in Get-Content $state){ if($l -match '^(.*)=(0|1)$'){ $prev[$matches[1]]=($matches[2] -eq '1') } } }
 function Send($t){ try{ Invoke-RestMethod -Method Post -Uri ("https://api.telegram.org/bot$token/sendMessage") -Body @{chat_id=$chat;text=$t}|Out-Null }catch{} }
-foreach($h in $peers.Keys){ if($prev.ContainsKey($h) -and $prev[$h] -ne $peers[$h]){ if($peers[$h]){ Send ("ONLINE  - " + (Nm $h)) } else { Send ("OFFLINE - " + (Nm $h)) } } }
+foreach($h in $peers.Keys){ if($first){ continue } $was=$false; if($prev.ContainsKey($h)){ $was=$prev[$h] } if($was -ne $peers[$h]){ if($peers[$h]){ Send ("ONLINE  - " + (Nm $h)) } else { Send ("OFFLINE - " + (Nm $h)) } } }
+foreach($h in $prev.Keys){ if(-not $peers.ContainsKey($h) -and $prev[$h]){ Send ("OFFLINE - " + (Nm $h)) } }
 ($peers.GetEnumerator()|ForEach-Object{ $_.Key+'='+([int][bool]$_.Value) })|Set-Content $state -Encoding utf8
 '@
   Set-Content (Join-Path $dir 'tg-watch.ps1') $w -Encoding utf8
