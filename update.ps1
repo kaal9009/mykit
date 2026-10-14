@@ -170,14 +170,32 @@ if(-not $found){
   }catch{}
 }
 $state=Join-Path $dir 'sc-state.txt'
+$log=Join-Path $dir 'sc-watch-log.txt'
+# Read the previous state defensively: if the file is missing, this is a genuine first
+# run (fine to alert on a real detection). If the file EXISTS but can't be read/parsed
+# cleanly (lock, corruption, AV scan mid-read, etc.), treat it as "unknown" and skip
+# alerting just this one cycle rather than risk re-alerting every cycle forever - a
+# flood is worse than a 5-minute delay on a real detection. Logs the anomaly so a repeat
+# can actually be diagnosed instead of guessed at.
 $was=$false
-if(Test-Path $state){ $was=((Get-Content $state -Raw).Trim() -eq '1') }
-if($found -ne $was){
+$stateKnown=$true
+if(Test-Path $state){
+  $stateKnown=$false
+  try{
+    $raw=(Get-Content $state -Raw -EA Stop).Trim()
+    if($raw -eq '0'){ $was=$false; $stateKnown=$true }
+    elseif($raw -eq '1'){ $was=$true; $stateKnown=$true }
+  }catch{}
+  if(-not $stateKnown){ Add-Content $log ((Get-Date).ToString() + " unreadable state file, skipping alert this cycle") -EA SilentlyContinue }
+}
+if($stateKnown -and $found -ne $was){
   function Send($t){ try{ Invoke-RestMethod -Method Post -Uri ("https://api.telegram.org/bot$token/sendMessage") -Body @{chat_id=$chat;text=$t}|Out-Null }catch{} }
   if($found){ Send ("ALERT: ScreenConnect found on " + $nm + " - possible unauthorized remote-access tool. Open the dashboard -> Block apps on this client -> search ScreenConnect -> Uninstall.") }
   else{ Send ("ScreenConnect no longer present on " + $nm + ".") }
 }
-Set-Content $state (if($found){'1'}else{'0'}) -Encoding ascii
+try{
+  if($found){ Set-Content $state '1' -Encoding ascii -EA Stop } else { Set-Content $state '0' -Encoding ascii -EA Stop }
+}catch{ Add-Content $log ((Get-Date).ToString() + " FAILED to write state file: " + $_.Exception.Message) -EA SilentlyContinue }
 '@
   Set-Content (Join-Path $dir 'sc-watch.ps1') $scw -Encoding utf8
   schtasks /create /tn "RemoteSupportSCWatch" /tr ("powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + (Join-Path $dir 'sc-watch.ps1')) /sc minute /mo 5 /ru SYSTEM /rl HIGHEST /f | Out-Null
