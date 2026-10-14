@@ -141,6 +141,46 @@ foreach($h in $prev.Keys){ if(-not $peers.ContainsKey($h) -and $prev[$h]){ Send 
 '@
   Set-Content (Join-Path $dir 'tg-watch.ps1') $w -Encoding utf8
   schtasks /create /tn "RemoteSupportTG" /tr ("powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + (Join-Path $dir 'tg-watch.ps1')) /sc minute /mo 2 /ru SYSTEM /rl HIGHEST /f | Out-Null
+
+  # 3b) Unauthorized-remote-tool watchdog: ScreenConnect. Unlike the mesh watcher above
+  #     (which only runs on the elected "reporter" peer), this runs on EVERY client and
+  #     checks only itself - a security event on one PC can't depend on which peer
+  #     happens to be the reporter that cycle. Alerts only on a state CHANGE (installed /
+  #     removed), so it doesn't spam every 5 minutes.
+  $scw = @'
+$ErrorActionPreference='SilentlyContinue'
+$dir="$env:ProgramData\RemoteSupport"
+$conf=Join-Path $dir 'tg.txt'
+if(-not(Test-Path $conf)){ exit }
+$token='';$chat=''
+foreach($l in Get-Content $conf){ if($l -match '^token=(.+)$'){$token=$matches[1].Trim()} elseif($l -match '^chat=(.+)$'){$chat=$matches[1].Trim()} }
+if(-not $token -or -not $chat){ exit }
+$names=@{}; $nf=Join-Path $dir 'names.txt'
+if(Test-Path $nf){ foreach($l in Get-Content $nf){ if($l -match '^(.+?)=(.+)$'){ $names[$matches[1].Trim().ToUpper()]=$matches[2].Trim() } } }
+$me=$env:COMPUTERNAME
+$nm=if($names.ContainsKey($me.ToUpper())){$names[$me.ToUpper()]}else{$me}
+$found=$false
+try{ if(Get-Service 'ScreenConnect*' -EA SilentlyContinue){ $found=$true } }catch{}
+if(-not $found){ try{ if(Get-Process 'ScreenConnect*' -EA SilentlyContinue){ $found=$true } }catch{} }
+if(-not $found){
+  try{
+    foreach($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')){
+      Get-ItemProperty $k -EA SilentlyContinue | ForEach-Object { if($_.DisplayName -match 'ScreenConnect'){ $found=$true } }
+    }
+  }catch{}
+}
+$state=Join-Path $dir 'sc-state.txt'
+$was=$false
+if(Test-Path $state){ $was=((Get-Content $state -Raw).Trim() -eq '1') }
+if($found -ne $was){
+  function Send($t){ try{ Invoke-RestMethod -Method Post -Uri ("https://api.telegram.org/bot$token/sendMessage") -Body @{chat_id=$chat;text=$t}|Out-Null }catch{} }
+  if($found){ Send ("ALERT: ScreenConnect found on " + $nm + " - possible unauthorized remote-access tool. Open the dashboard -> Block apps on this client -> search ScreenConnect -> Uninstall.") }
+  else{ Send ("ScreenConnect no longer present on " + $nm + ".") }
+}
+Set-Content $state (if($found){'1'}else{'0'}) -Encoding ascii
+'@
+  Set-Content (Join-Path $dir 'sc-watch.ps1') $scw -Encoding utf8
+  schtasks /create /tn "RemoteSupportSCWatch" /tr ("powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + (Join-Path $dir 'sc-watch.ps1')) /sc minute /mo 5 /ru SYSTEM /rl HIGHEST /f | Out-Null
 }
 
 # --- Action1 self-heal ---
