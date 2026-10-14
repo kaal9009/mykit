@@ -741,8 +741,20 @@ if(`$hits.Count -eq 0){ 'NONE' } else { `$hits -join '; ' }
     $script:appScanCache.Remove($ip)
     if (-not $r) { return "No response from client - it may be offline. Try again." }
     $r = $r.Trim()
-    if ($r -eq 'NONE') { return "Nothing found matching '$pattern' (no service/process/folder/registry entry) - check the spelling, or it's already gone." }
-    return "Force-cleaned everything matching '$pattern': $r"
+    if ($r -eq 'NONE') { return "Nothing found matching '$pattern' - check the spelling, or it's already gone." }
+    # Keep the popup short: counts only, not every full service/path name (that detail
+    # was fine on the PC's side but unreadable as a message to read quickly).
+    $items = $r -split '; '
+    $svc = @($items | Where-Object { $_ -like 'service:*' }).Count
+    $proc = @($items | Where-Object { $_ -like 'process:*' }).Count
+    $fold = @($items | Where-Object { $_ -like 'folder:*' }).Count
+    $reg = @($items | Where-Object { $_ -like 'regkey:*' }).Count
+    $parts = @()
+    if ($svc) { $parts += "$svc service(s)" }
+    if ($proc) { $parts += "$proc process(es)" }
+    if ($fold) { $parts += "$fold folder(s)" }
+    if ($reg) { $parts += "$reg registry entry(ies)" }
+    return "'$pattern' removed - " + ($parts -join ', ') + "."
 }
 function Blocked-All {
     $out = @()
@@ -1460,7 +1472,7 @@ async function forceClean(){
   let msg='';try{const r=await fetch('/api/forceclean',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,pattern:v})});msg=(await r.json()).output||'';}catch(e){}
   btn.disabled=false;btn.textContent='Force clean';
   alert(msg||'No response from client.');
-  if(msg&&msg.indexOf('Force-cleaned')===0){document.getElementById('forceCleanName').value='';appMgr(true);}
+  if(msg&&msg.indexOf('removed - ')>-1){document.getElementById('forceCleanName').value='';appMgr(true);}
 }
 async function fleetBlocked(){
   let o=document.getElementById('appWrap');if(o)o.innerHTML='<div style="color:#9fb0d0;font-size:13px;padding:10px">Checking all clients...</div>';
