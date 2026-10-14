@@ -1404,7 +1404,8 @@ function showAppModal(apps,bset,pset,cname,ip,failed){
     '<input id="appSearch" placeholder="Filter apps..." oninput="appFilter()" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:13px;margin-bottom:10px">'+
     '<div style="display:flex;gap:6px;margin-bottom:12px"><input id="appManual" placeholder="or type an .exe to block (e.g. teamviewer.exe)" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:12.5px"><button onclick="appBlockManual()" style="padding:8px 12px;border-radius:6px;border:1px solid #7a3a42;background:#3a2226;color:#e0868f;cursor:pointer;font-size:12.5px">Block</button></div>'+
     '<div style="background:#1f1510;border:1px solid #7a5a2e;border-radius:8px;padding:10px;margin-bottom:12px"><div style="font-size:12px;color:#e0b86f;margin-bottom:6px">Force-clean by name - for an app that was renamed/rebranded so it doesn\'t show a normal uninstaller above (e.g. a relabeled remote-access tool). Type the exact name/text you see in the list, e.g. "ScreenConnect" or whatever it was renamed to - this kills any matching service/process, deletes its install folder, and removes its registry entry.</div>'+
-    '<div style="display:flex;gap:6px"><input id="forceCleanName" placeholder="exact name as seen above, e.g. ScreenConnect" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:12.5px"><button onclick="forceClean()" style="padding:8px 12px;border-radius:6px;border:1px solid #9c4a1a;background:#3a2410;color:#ffb366;cursor:pointer;font-size:12.5px">Force clean</button></div></div>'+
+    '<div style="position:relative"><div style="display:flex;gap:6px"><input id="forceCleanName" placeholder="exact name as seen above, e.g. ScreenConnect" oninput="forceCleanSuggest()" onfocus="forceCleanSuggest()" autocomplete="off" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:12.5px"><button onclick="forceClean()" style="padding:8px 12px;border-radius:6px;border:1px solid #9c4a1a;background:#3a2410;color:#ffb366;cursor:pointer;font-size:12.5px">Force clean</button></div>'+
+    '<div id="forceCleanSug" style="display:none;position:absolute;left:0;right:94px;top:38px;background:#0f1420;border:1px solid #2c3752;border-radius:6px;max-height:160px;overflow:auto;z-index:20;box-shadow:0 6px 18px rgba(0,0,0,.5)"></div></div></div>'+
     '<div id="appList">'+head+(rows||'')+(apps.length?'':'<div style="color:#7d8aa5;font-size:12px;padding:10px">No apps found. Use the box above to block by name.</div>')+'</div>';
   document.body.appendChild(o);
 }
@@ -1463,10 +1464,42 @@ async function appBlockManual(){const ip=document.getElementById('appWrap').data
     if(!appCache[ip].apps.some(a=>(a.exe||'').toLowerCase()===v))appCache[ip].apps.push({name:v,exe:v});
     showAppModal(appCache[ip].apps,s,new Set(appCache[ip].prot),clients.find(c=>c.ip===ip)?.name||'',ip);}
 }
+function forceCleanSuggest(){
+  const ip=document.getElementById('appWrap').dataset.ip;
+  const box=document.getElementById('forceCleanSug');
+  const q=(document.getElementById('forceCleanName').value||'').trim().toLowerCase();
+  if(!q){box.style.display='none';box.innerHTML='';return;}
+  const apps=(appCache[ip]&&appCache[ip].apps)||[];
+  const seen=new Set();
+  const matches=apps.filter(a=>{
+    const nm=(a.name||'').toLowerCase();
+    if(!nm||!nm.includes(q))return false;
+    if(seen.has(nm))return false;
+    seen.add(nm);return true;
+  }).slice(0,8);
+  if(!matches.length){box.style.display='none';box.innerHTML='';return;}
+  box.innerHTML=matches.map(a=>{
+    const attr=esc(a.name).replace(/"/g,'&quot;');
+    return '<div onmousedown="pickForceClean(\''+attr.replace(/'/g,"\\'")+'\')" style="padding:7px 10px;cursor:pointer;font-size:12.5px;color:#e6eaf2;border-bottom:1px solid #1d2537" onmouseover="this.style.background=\'#1c2538\'" onmouseout="this.style.background=\'transparent\'">'+esc(a.name)+'</div>';
+  }).join('');
+  box.style.display='block';
+}
+function pickForceClean(nm){
+  const input=document.getElementById('forceCleanName');
+  // reverse the &quot; entity used for the attribute - the input's actual value needs
+  // the plain character back, not the HTML-escaped form.
+  input.value=nm.replace(/&quot;/g,'"').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+  document.getElementById('forceCleanSug').style.display='none';
+}
+document.addEventListener('click',(e)=>{
+  const sug=document.getElementById('forceCleanSug');
+  if(sug && !e.target.closest('#forceCleanName') && !e.target.closest('#forceCleanSug')) sug.style.display='none';
+});
 async function forceClean(){
   const ip=document.getElementById('appWrap').dataset.ip;
   const v=(document.getElementById('forceCleanName').value||'').trim();
   if(!v)return;
+  document.getElementById('forceCleanSug').style.display='none';
   if(!confirm('Force-clean everything named like "'+v+'" on this PC?\n\nThis kills any matching service/process, deletes its install folder, and removes its registry entry - no undo. Only do this for something you\'ve identified as unwanted.'))return;
   const btn=event.target;btn.disabled=true;btn.textContent='Cleaning...';
   let msg='';try{const r=await fetch('/api/forceclean',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,pattern:v})});msg=(await r.json()).output||'';}catch(e){}
