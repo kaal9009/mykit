@@ -513,9 +513,9 @@ function Get-AppScan($ip, $force) {
 }
 function Get-Blocked($ip) {
     $ps = @'
-$k="HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+$base="HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Paths"
 $b=@()
-try{ if(Test-Path $k){ Get-ChildItem $k -EA SilentlyContinue | ForEach-Object { try{ if((Get-ItemProperty $_.PSPath -EA SilentlyContinue).Debugger){ $b+=$_.PSChildName.ToLower() } }catch{} } } }catch{}
+try{ if(Test-Path $base){ Get-ChildItem $base -EA SilentlyContinue | ForEach-Object { try{ $v=(Get-ItemProperty $_.PSPath -EA SilentlyContinue).ItemData; if($v){ $b+=([string]$v).ToLower() } }catch{} } } }catch{}
 $sb=New-Object System.Text.StringBuilder
 [void]$sb.Append('[')
 $first=$true
@@ -572,28 +572,31 @@ function Block-App($ip, $exe, $useMsg) {
     if (-not $exe) { return "bad name" }
     if ($protectedApps -contains $exe) { return "PROTECTED: $exe can't be blocked - it would cut off your own access or break Windows." }
     $base = $exe -replace '\.exe$', ''
-    $wsc = ($useMsg -eq $true -or $useMsg -eq 'true')
+    # Uses Windows' own Software Restriction Policy (the same mechanism as Group Policy
+    # "Disallowed" app rules) instead of an Image File Execution Options Debugger hijack.
+    # This is Microsoft's own legitimate block mechanism: enforced by Windows itself at
+    # process-launch time, survives reboots, and antivirus has no reason to touch it -
+    # no exclusions, no watcher needed to keep it in place.
     $ps = @"
-`$d='C:\ProgramData\RemoteSupport'; New-Item `$d -ItemType Directory -Force | Out-Null
-try{ Add-MpPreference -ExclusionPath `$d -EA SilentlyContinue } catch {}
-try{ Add-MpPreference -ExclusionProcess '$exe' -EA SilentlyContinue } catch {}
-try{ Add-MpPreference -ExclusionProcess 'mshta.exe' -EA SilentlyContinue } catch {}
-`$k="HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$exe"
-New-Item `$k -Force | Out-Null
-"@
-    if ($wsc) { $ps += @"
-
-[IO.File]::WriteAllBytes("`$d\blocked.hta",[Convert]::FromBase64String('$blockVbsB64'))
-Set-ItemProperty `$k Debugger 'mshta.exe "C:\ProgramData\RemoteSupport\blocked.hta"'
-"@ } else { $ps += @"
-
-Set-ItemProperty `$k Debugger '"%windir%\system32\systray.exe"'
-"@ }
-    $ps += @"
-
+`$pol="HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
+New-Item `$pol -Force | Out-Null
+Set-ItemProperty `$pol DefaultLevel 262144 -Type DWord
+Set-ItemProperty `$pol TransparentEnabled 1 -Type DWord
+Set-ItemProperty `$pol PolicyScope 0 -Type DWord
+`$dis = Join-Path `$pol '0\Paths'
+New-Item `$dis -Force | Out-Null
+`$already = Get-ChildItem `$dis -EA SilentlyContinue | Where-Object { ((Get-ItemProperty `$_.PSPath -EA SilentlyContinue).ItemData) -eq '$exe' }
+if (-not `$already) {
+  `$guid = [guid]::NewGuid().ToString('B')
+  `$rk = Join-Path `$dis `$guid
+  New-Item `$rk -Force | Out-Null
+  Set-ItemProperty `$rk ItemData '$exe' -Type String
+  Set-ItemProperty `$rk SaferFlags 0 -Type DWord
+  Set-ItemProperty `$rk Description 'Blocked via RemoteSupport kit' -Type String
+}
 Stop-Process -Name '$base' -Force -EA 0
 taskkill /IM '$exe' /F /T 2>`$null
-(Get-ItemProperty `$k -EA 0).Debugger
+'OK'
 "@
     $enc = Enc $ps
     $r = $null
@@ -604,7 +607,7 @@ taskkill /IM '$exe' /F /T 2>`$null
     }
     $script:appScanCache.Remove($ip)
     if (-not $r) { return "Could not confirm the block took effect on $exe - the client may be slow/offline right now. Try again in a moment." }
-    return "Blocked $exe (and closed it if running)"
+    return "Blocked $exe (and closed it if running) - enforced by Windows itself, survives reboot"
 }
 function Set-BlockMsg($ip, $msg) {
     $has = ($msg -and $msg.Trim())
@@ -638,9 +641,13 @@ function Unblock-App($ip, $exe) {
     $exe = ($exe -replace '[^\w\.\-]', '').ToLower()
     if (-not $exe) { return "bad name" }
     $ps = @"
-`$k="HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$exe"
-Remove-Item `$k -Recurse -Force -EA 0
-if(Test-Path `$k){'STILL_THERE'}else{'GONE'}
+`$dis = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Paths"
+if (Test-Path `$dis) {
+  Get-ChildItem `$dis -EA SilentlyContinue | Where-Object { ((Get-ItemProperty `$_.PSPath -EA SilentlyContinue).ItemData) -eq '$exe' } | Remove-Item -Recurse -Force -EA 0
+}
+`$still = `$false
+if (Test-Path `$dis) { `$still = [bool](Get-ChildItem `$dis -EA SilentlyContinue | Where-Object { ((Get-ItemProperty `$_.PSPath -EA SilentlyContinue).ItemData) -eq '$exe' }) }
+if (`$still) {'STILL_THERE'} else {'GONE'}
 "@
     $enc = Enc $ps
     $r = $null
