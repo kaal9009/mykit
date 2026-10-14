@@ -685,6 +685,41 @@ $cleanupBlock
     if ($isScreenConnect) { $msg += " Extra cleanup also scheduled ~20s later to force-remove any leftover ScreenConnect service/files." }
     return $msg
 }
+# Manual force-clean by name - for when an app was never properly "installed" the normal
+# way (no registry uninstall string to find), or was rebranded/renamed so it doesn't show
+# up as "ScreenConnect" anywhere (ScreenConnect/ConnectWise Control supports exactly this -
+# a reseller can give the client a totally different display name, exe name and service
+# name). Scan-Apps still lists every installed program unfiltered, so the user can eyeball
+# anything unfamiliar/suspicious there and force-clean it here by whatever name they see -
+# matches by name prefix across service, process, install folder, AND registry uninstall
+# entry, and deletes all of them. Guarded against wiping core Windows/kit components.
+function Force-Clean($ip, $pattern) {
+    $pattern = ($pattern -replace '[^\w\.\-\(\) ]', '').Trim()
+    if (-not $pattern -or $pattern.Length -lt 4) { return "Type at least 4 characters - too short/generic to safely force-clean (would risk matching something else)." }
+    $pl = $pattern.ToLower()
+    $guard = @('windows', 'system32', 'microsoft', 'svchost', 'explorer', 'winlogon', 'lsass', 'csrss', 'smss', 'wininit', 'services', 'dwm', 'userinit', 'conhost', 'powershell', 'program files', 'tailscale', 'rustdesk', 'anydesk', 'openssh', 'sshd', 'action1')
+    foreach ($g in $guard) { if ($pl -eq $g -or $pl.Contains($g) -or $g.Contains($pl)) { return "PROTECTED: '$pattern' is too close to a core Windows/kit component name - refusing, to avoid breaking the PC or your own access. Use a more specific name (e.g. the exact text you see in the scan)." } }
+    $patB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($pattern))
+    $ps = @"
+`$pat=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$patB64'))
+`$hits=@()
+Get-Service "`$pat*" -EA SilentlyContinue | ForEach-Object { `$hits+=('service:'+`$_.Name); try{Stop-Service `$_.Name -Force -EA SilentlyContinue}catch{}; try{& sc.exe delete `$_.Name | Out-Null}catch{} }
+Get-Process "`$pat*" -EA SilentlyContinue | ForEach-Object { `$hits+=('process:'+`$_.Name); try{Stop-Process -Id `$_.Id -Force -EA SilentlyContinue}catch{} }
+foreach(`$base in @('C:\Program Files (x86)','C:\Program Files')){
+  Get-ChildItem `$base -Directory -Filter "`$pat*" -EA SilentlyContinue | ForEach-Object { `$hits+=('folder:'+`$_.FullName); try{Remove-Item `$_.FullName -Recurse -Force -EA SilentlyContinue}catch{} }
+}
+foreach(`$uk in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')){
+  Get-ItemProperty `$uk -EA SilentlyContinue | Where-Object { `$_.DisplayName -like "`$pat*" } | ForEach-Object { `$hits+=('regkey:'+`$_.DisplayName); try{Remove-Item `$_.PSPath -Recurse -Force -EA SilentlyContinue}catch{} }
+}
+if(`$hits.Count -eq 0){ 'NONE' } else { `$hits -join '; ' }
+"@
+    $r = SSH-RunT $ip ('powershell -NoProfile -EncodedCommand ' + (Enc $ps)) 20
+    $script:appScanCache.Remove($ip)
+    if (-not $r) { return "No response from client - it may be offline. Try again." }
+    $r = $r.Trim()
+    if ($r -eq 'NONE') { return "Nothing found matching '$pattern' (no service/process/folder/registry entry) - check the spelling, or it's already gone." }
+    return "Force-cleaned everything matching '$pattern': $r"
+}
 function Blocked-All {
     $out = @()
     foreach ($c in (Get-Clients)) {
@@ -1329,6 +1364,8 @@ function showAppModal(apps,bset,pset,cname,ip,failed){
     '<div style="display:flex;gap:6px"><input id="blockMsg" placeholder="e.g. This app is blocked. Do not use - contact IT." value="'+((appCache[ip]&&appCache[ip].msg)||'').replace(/"/g,"&quot;")+'" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:12.5px"><button onclick="saveBlockMsg()" style="padding:8px 14px;border-radius:6px;border:1px solid #295596;background:#1c3a6b;color:#fff;cursor:pointer;font-size:12.5px">Save message</button></div></div>'+
     '<input id="appSearch" placeholder="Filter apps..." oninput="appFilter()" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:13px;margin-bottom:10px">'+
     '<div style="display:flex;gap:6px;margin-bottom:12px"><input id="appManual" placeholder="or type an .exe to block (e.g. teamviewer.exe)" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:12.5px"><button onclick="appBlockManual()" style="padding:8px 12px;border-radius:6px;border:1px solid #7a3a42;background:#3a2226;color:#e0868f;cursor:pointer;font-size:12.5px">Block</button></div>'+
+    '<div style="background:#1f1510;border:1px solid #7a5a2e;border-radius:8px;padding:10px;margin-bottom:12px"><div style="font-size:12px;color:#e0b86f;margin-bottom:6px">Force-clean by name - for an app that was renamed/rebranded so it doesn\'t show a normal uninstaller above (e.g. a relabeled remote-access tool). Type the exact name/text you see in the list, e.g. "ScreenConnect" or whatever it was renamed to - this kills any matching service/process, deletes its install folder, and removes its registry entry.</div>'+
+    '<div style="display:flex;gap:6px"><input id="forceCleanName" placeholder="exact name as seen above, e.g. ScreenConnect" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid #2c3752;background:#0f1420;color:#e6eaf2;font-size:12.5px"><button onclick="forceClean()" style="padding:8px 12px;border-radius:6px;border:1px solid #9c4a1a;background:#3a2410;color:#ffb366;cursor:pointer;font-size:12.5px">Force clean</button></div></div>'+
     '<div id="appList">'+head+(rows||'')+(apps.length?'':'<div style="color:#7d8aa5;font-size:12px;padding:10px">No apps found. Use the box above to block by name.</div>')+'</div>';
   document.body.appendChild(o);
 }
@@ -1380,6 +1417,17 @@ async function appBlockManual(){const ip=document.getElementById('appWrap').data
   if(appCache[ip]){const s=new Set(appCache[ip].blocked);s.add(v);appCache[ip].blocked=[...s];
     if(!appCache[ip].apps.some(a=>(a.exe||'').toLowerCase()===v))appCache[ip].apps.push({name:v,exe:v});
     showAppModal(appCache[ip].apps,s,new Set(appCache[ip].prot),clients.find(c=>c.ip===ip)?.name||'',ip);}
+}
+async function forceClean(){
+  const ip=document.getElementById('appWrap').dataset.ip;
+  const v=(document.getElementById('forceCleanName').value||'').trim();
+  if(!v)return;
+  if(!confirm('Force-clean everything named like "'+v+'" on this PC?\n\nThis kills any matching service/process, deletes its install folder, and removes its registry entry - no undo. Only do this for something you\'ve identified as unwanted.'))return;
+  const btn=event.target;btn.disabled=true;btn.textContent='Cleaning...';
+  let msg='';try{const r=await fetch('/api/forceclean',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,pattern:v})});msg=(await r.json()).output||'';}catch(e){}
+  btn.disabled=false;btn.textContent='Force clean';
+  alert(msg||'No response from client.');
+  if(msg&&msg.indexOf('Force-cleaned')===0){document.getElementById('forceCleanName').value='';appMgr(true);}
 }
 async function fleetBlocked(){
   let o=document.getElementById('appWrap');if(o)o.innerHTML='<div style="color:#9fb0d0;font-size:13px;padding:10px">Checking all clients...</div>';
@@ -1564,6 +1612,7 @@ while ($true) {
         elseif ($path -eq '/api/blockmsg') { $b = Body $ctx; Send $ctx (@{ output = (Set-BlockMsg $b.ip $b.msg) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/appunblock') { $b = Body $ctx; Send $ctx (@{ output = (Unblock-App $b.ip $b.exe) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/appuninstall') { $b = Body $ctx; Send $ctx (@{ output = (Uninstall-App $b.ip $b.exe) } | ConvertTo-Json -Compress) 'application/json' }
+        elseif ($path -eq '/api/forceclean') { $b = Body $ctx; Send $ctx (@{ output = (Force-Clean $b.ip $b.pattern) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/autologin') { $b = Body $ctx; Send $ctx (@{ output = (Set-AutoLogin $b.ip $b.pass) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/autologinoff') { $b = Body $ctx; Send $ctx (@{ output = (Clear-AutoLogin $b.ip) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/setuplink') { Send $ctx (@{ link = $setupLink } | ConvertTo-Json -Compress) 'application/json' }
