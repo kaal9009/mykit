@@ -450,16 +450,25 @@ function Get-AppScan($ip, $force) {
             $sb = New-Object System.Text.StringBuilder
             [void]$sb.Append('[')
             $first = $true
+            $idx = 0
             foreach ($m in $rx.Matches($rawApps)) {
                 try {
                     $name = JUnesc $m.Groups[1].Value
                     $exe = (JUnesc $m.Groups[2].Value).ToLower()
                     $uninst = JUnesc $m.Groups[3].Value
                     if ($exe -and $uninst) { $uninstMap[$exe] = $uninst }
+                    # Some installed programs (ScreenConnect among them, when its registry
+                    # DisplayIcon/InstallLocation doesn't resolve to a real .exe on disk)
+                    # have no usable exe name - Scan-Apps still lists them (name + uninstall
+                    # string only). Those can't be keyed by exe, so key them by their
+                    # position in this scan instead - "idx" is echoed back in the JSON row
+                    # and threaded through so Uninstall/Force-Clean still works on them.
+                    elseif ($uninst) { $uninstMap["#$idx"] = $uninst }
                     $un = $(if ($uninst) { 1 } else { 0 })
                     if (-not $first) { [void]$sb.Append(',') }
                     $first = $false
-                    [void]$sb.Append('{"name":"'); [void]$sb.Append((JEsc $name)); [void]$sb.Append('","exe":"'); [void]$sb.Append((JEsc $exe)); [void]$sb.Append('","un":'); [void]$sb.Append($un); [void]$sb.Append('}')
+                    [void]$sb.Append('{"name":"'); [void]$sb.Append((JEsc $name)); [void]$sb.Append('","exe":"'); [void]$sb.Append((JEsc $exe)); [void]$sb.Append('","un":'); [void]$sb.Append($un); [void]$sb.Append(',"idx":'); [void]$sb.Append($idx); [void]$sb.Append('}')
+                    $idx++
                 } catch {}
             }
             [void]$sb.Append(']')
@@ -627,27 +636,42 @@ if (`$still) {'STILL_THERE'} else {'GONE'}
     if ($r -ne 'GONE') { return "Could not confirm $exe was unblocked - the client may be slow/offline right now. Try again in a moment." }
     return "Unblocked $exe"
 }
-function Uninstall-App($ip, $exe) {
+function Uninstall-App($ip, $exe, $idx, $name) {
     $exe = ($exe -replace '[^\w\.\-]', '').ToLower()
-    if (-not $exe) { return "bad name" }
-    if ($protectedApps -contains $exe) { return "PROTECTED: $exe can't be uninstalled - it's one of your own access tools." }
+    # Some installed programs have no usable exe name (their registry entry's
+    # DisplayIcon/InstallLocation doesn't resolve to a real .exe on disk - ScreenConnect hit
+    # this exact case). Those were scanned and DO have a real uninstall string, just keyed
+    # by scan position ("#idx") instead of exe - fall back to that instead of failing with
+    # "bad name" the moment exe is empty.
+    $lookupKey = $exe
+    $label = $exe
+    if (-not $exe) {
+        if ($null -eq $idx -or $idx -eq '') { return "bad name" }
+        $lookupKey = "#$idx"
+        $label = $(if ($name) { $name } else { "this app" })
+    } elseif ($protectedApps -contains $exe) {
+        return "PROTECTED: $exe can't be uninstalled - it's one of your own access tools."
+    }
     $c = $script:appScanCache[$ip]
     $un = $null
-    if ($c -and $c.uninstMap -and $c.uninstMap.ContainsKey($exe)) { $un = $c.uninstMap[$exe] }
+    if ($c -and $c.uninstMap -and $c.uninstMap.ContainsKey($lookupKey)) { $un = $c.uninstMap[$lookupKey] }
     if (-not $un) {
-        # cache may be missing/stale - rescan once before giving up
+        # cache may be missing/stale - rescan once before giving up. Note: a rescan
+        # reassigns idx values by new scan order, so an idx-based lookup can legitimately
+        # miss after this if the app list order changed - the "no uninstaller found"
+        # message below covers that case too.
         $null = Get-AppScan $ip $true
         $c = $script:appScanCache[$ip]
-        if ($c -and $c.uninstMap -and $c.uninstMap.ContainsKey($exe)) { $un = $c.uninstMap[$exe] }
+        if ($c -and $c.uninstMap -and $c.uninstMap.ContainsKey($lookupKey)) { $un = $c.uninstMap[$lookupKey] }
     }
-    if (-not $un) { return "No uninstaller found for $exe - it may not be a properly installed program. Remove it manually from Settings > Apps on that PC." }
+    if (-not $un) { return "No uninstaller found for $label - it may not be a properly installed program. Remove it manually from Settings > Apps on that PC." }
     $unB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($un))
     # ScreenConnect specifically is known to leave a leftover service/files behind even
     # after its own (Inno Setup) uninstaller runs - common enough that dedicated 3rd-party
     # cleanup tools exist for exactly this. So on top of the normal uninstall below, also
     # force-stop/remove anything still named "ScreenConnect*" afterward, as a safety net -
     # scoped ONLY to that name prefix so it can never touch any other app.
-    $isScreenConnect = ($exe -match 'screenconnect')
+    $isScreenConnect = ($label -match 'screenconnect')
     $cleanupBlock = ''
     if ($isScreenConnect) {
         $cleanupBlock = @'
@@ -681,7 +705,7 @@ $cleanupBlock
 "@
     SSH-Fire $ip ('powershell -NoProfile -EncodedCommand ' + (Enc $ps))
     $script:appScanCache.Remove($ip)
-    $msg = "Uninstall started for $exe - running silently where the installer supports it. A few installer types (some InstallShield/WiX-based ones) may still show a window on the client."
+    $msg = "Uninstall started for $label - running silently where the installer supports it. A few installer types (some InstallShield/WiX-based ones) may still show a window on the client."
     if ($isScreenConnect) { $msg += " Extra cleanup also scheduled ~20s later to force-remove any leftover ScreenConnect service/files." }
     return $msg
 }
@@ -1333,15 +1357,18 @@ async function appMgr(force){
   else if(o)o.textContent='Ready.';
   showAppModal(apps,new Set(blocked),new Set(prot),sel.name,ip,failed);
 }
-function appRow(name,exe,blocked,prot,uninst){
+function appRow(name,exe,blocked,prot,uninst,idx){
   let right;
   if(prot) right='<span style="font-size:11px;color:#6f7ea0;border:1px solid #2c3752;border-radius:6px;padding:6px 10px">Protected</span>';
   else if(blocked) right='<button onclick="appToggle(this,\''+exe+'\',false)" style="padding:6px 12px;border-radius:6px;border:1px solid #2e7d46;background:#173d26;color:#8fe0a8;cursor:pointer;font-size:12px">Blocked \u2713 unblock</button>';
   else right='<button onclick="appToggle(this,\''+exe+'\',true)" style="padding:6px 12px;border-radius:6px;border:1px solid #7a3a42;background:#241a1d;color:#e0868f;cursor:pointer;font-size:12px">Block</button>';
   let un='';
-  if(!prot && uninst){un='<button onclick="appUninstall(this,\''+exe+'\')" style="padding:6px 12px;border-radius:6px;border:1px solid #7a5a2e;background:#2a2016;color:#e0b86f;cursor:pointer;font-size:12px;margin-left:6px">Uninstall</button>';}
+  // idx (a number, not the raw name) is embedded directly - never interpolate the app's
+  // display name straight into this onclick attribute, since a name can contain quotes.
+  // appUninstall() looks the real name back up from appCache by idx when it needs it.
+  if(!prot && uninst){un='<button onclick="appUninstall(this,\''+exe+'\','+(idx===undefined||idx===null?'null':idx)+')" style="padding:6px 12px;border-radius:6px;border:1px solid #7a5a2e;background:#2a2016;color:#e0b86f;cursor:pointer;font-size:12px;margin-left:6px">Uninstall</button>';}
   return '<div class="appRow" data-exe="'+exe+'" data-name="'+(name||'').toLowerCase()+'" style="display:flex;align-items:center;gap:10px;padding:8px 6px;border-bottom:1px solid #1d2537;'+(blocked?'background:#1c1417;':'')+'">'+
-    '<div style="flex:1"><div class="appName" style="font-size:13px;color:#eef2f8">'+esc(name)+'</div><div style="font-size:11px;color:#7d8aa5">'+esc(exe)+'</div></div>'+right+un+'</div>';
+    '<div style="flex:1"><div class="appName" style="font-size:13px;color:#eef2f8">'+esc(name)+'</div><div style="font-size:11px;color:#7d8aa5">'+esc(exe||'(no exe name - uses idx '+idx+')')+'</div></div>'+right+un+'</div>';
 }
 function showAppModal(apps,bset,pset,cname,ip,failed){
   let o=document.getElementById('appWrap');if(o)o.remove();
@@ -1351,8 +1378,8 @@ function showAppModal(apps,bset,pset,cname,ip,failed){
   const bl=[...bset].map(exe=>appMap.get(exe)||{name:exe,exe:exe});
   const rest=apps.filter(a=>!bset.has((a.exe||'').toLowerCase()));
   let head='';
-  if(bl.length){head='<div style="font-size:12px;color:#e0868f;font-weight:600;margin:4px 0 6px">Blocked ('+bl.length+')</div>'+bl.map(a=>appRow(a.name,(a.exe||'').toLowerCase(),true,false,a.un===1)).join('')+'<div style="font-size:12px;color:#8fa0c0;font-weight:600;margin:14px 0 6px">All apps</div>';}
-  let rows=rest.map(a=>{const ex=(a.exe||'').toLowerCase();return appRow(a.name,ex,false,pset.has(ex),a.un===1);}).join('');
+  if(bl.length){head='<div style="font-size:12px;color:#e0868f;font-weight:600;margin:4px 0 6px">Blocked ('+bl.length+')</div>'+bl.map(a=>appRow(a.name,(a.exe||'').toLowerCase(),true,false,a.un===1,a.idx)).join('')+'<div style="font-size:12px;color:#8fa0c0;font-weight:600;margin:14px 0 6px">All apps</div>';}
+  let rows=rest.map(a=>{const ex=(a.exe||'').toLowerCase();return appRow(a.name,ex,false,pset.has(ex),a.un===1,a.idx);}).join('');
   let warn=failed?'<div style="font-size:11.5px;color:#e0b86f;background:#2a2016;border:1px solid #7a5a2e;border-radius:6px;padding:8px 10px;margin-bottom:10px">This client was slow to answer, so the list below may be incomplete. Hit Rescan to try a full scan again.</div>':'';
   o.innerHTML='<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="font-size:15px;color:#fff;font-weight:600">Block apps on '+esc(cname)+'</div>'+
     '<button onclick="appMgr(true)" style="margin-left:auto;background:none;border:1px solid #2c3752;color:#9fb0d0;border-radius:6px;padding:5px 10px;cursor:pointer">Rescan</button>'+
@@ -1380,12 +1407,18 @@ async function appToggle(btn,exe,block){
   if(appCache[ip]){const s=new Set(appCache[ip].blocked);if(block)s.add(exe);else s.delete(exe);appCache[ip].blocked=[...s];
     showAppModal(appCache[ip].apps,s,new Set(appCache[ip].prot),clients.find(c=>c.ip===ip)?.name||'',ip);}
 }
-async function appUninstall(btn,exe){
-  if(!confirm('Uninstall '+exe+' on this PC?\n\nThis runs the app\'s real uninstaller on the client silently (no window on their screen), where that installer supports it.'))return;
+async function appUninstall(btn,exe,idx){
   const ip=document.getElementById('appWrap').dataset.ip;
+  // exe can be empty - some installed programs have no usable .exe name on record (their
+  // registry entry doesn't resolve to a real file). Those are looked up by idx instead;
+  // pull the real display name back from the cached scan for messages/confirm text.
+  const appsNow=(appCache[ip]&&appCache[ip].apps)||[];
+  const appObj=(idx!==null&&idx!==undefined)?appsNow.find(a=>a.idx===idx):null;
+  const nm=(appObj&&appObj.name)||exe||'this app';
+  if(!confirm('Uninstall '+nm+' on this PC?\n\nThis runs the app\'s real uninstaller on the client silently (no window on their screen), where that installer supports it.'))return;
   const cname=(clients.find(c=>c.ip===ip)||{}).name||'';
   btn.disabled=true;btn.textContent='Uninstalling...';
-  let msg='';try{const r=await fetch('/api/appuninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,exe})});msg=(await r.json()).output||'';}catch(e){}
+  let msg='';try{const r=await fetch('/api/appuninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,exe,idx,name:nm})});msg=(await r.json()).output||'';}catch(e){}
   if(!/started/i.test(msg)){alert(msg||'No response from client.');btn.disabled=false;btn.textContent='Uninstall';return;}
   btn.textContent='Verifying...';
   await new Promise(res=>setTimeout(res,15000));
@@ -1395,10 +1428,10 @@ async function appUninstall(btn,exe){
     const j2=await r2.json();
     apps2=JSON.parse(j2.apps||'[]');blocked2=JSON.parse(j2.blocked||'[]');prot2=(j2.protected||'').split(',');
     appCache[ip]={apps:apps2,blocked:blocked2,prot:prot2,msg:j2.blockmsg||''};
-    stillThere=apps2.some(a=>(a.exe||'').toLowerCase()===exe);
+    stillThere=exe?apps2.some(a=>(a.exe||'').toLowerCase()===exe):apps2.some(a=>(a.name||'')===nm);
   }catch(e){}
-  if(stillThere){alert(exe+' still shows as installed.\n\nEither the uninstaller needed a click on the client\'s screen, or it just needs more time - try Uninstall or Rescan again in a bit.');}
-  else{alert(exe+' - confirmed uninstalled, it no longer shows up in the scan.');}
+  if(stillThere){alert(nm+' still shows as installed.\n\nEither the uninstaller needed a click on the client\'s screen, or it just needs more time - try Uninstall or Rescan again in a bit.');}
+  else{alert(nm+' - confirmed uninstalled, it no longer shows up in the scan.');}
   if(apps2.length||blocked2.length)showAppModal(apps2,new Set(blocked2),new Set(prot2),cname,ip);
 }
 async function saveBlockMsg(){
@@ -1611,7 +1644,7 @@ while ($true) {
         elseif ($path -eq '/api/appblock') { $b = Body $ctx; Send $ctx (@{ output = (Block-App $b.ip $b.exe $b.usemsg) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/blockmsg') { $b = Body $ctx; Send $ctx (@{ output = (Set-BlockMsg $b.ip $b.msg) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/appunblock') { $b = Body $ctx; Send $ctx (@{ output = (Unblock-App $b.ip $b.exe) } | ConvertTo-Json -Compress) 'application/json' }
-        elseif ($path -eq '/api/appuninstall') { $b = Body $ctx; Send $ctx (@{ output = (Uninstall-App $b.ip $b.exe) } | ConvertTo-Json -Compress) 'application/json' }
+        elseif ($path -eq '/api/appuninstall') { $b = Body $ctx; Send $ctx (@{ output = (Uninstall-App $b.ip $b.exe $b.idx $b.name) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/forceclean') { $b = Body $ctx; Send $ctx (@{ output = (Force-Clean $b.ip $b.pattern) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/autologin') { $b = Body $ctx; Send $ctx (@{ output = (Set-AutoLogin $b.ip $b.pass) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/autologinoff') { $b = Body $ctx; Send $ctx (@{ output = (Clear-AutoLogin $b.ip) } | ConvertTo-Json -Compress) 'application/json' }
