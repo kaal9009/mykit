@@ -642,6 +642,23 @@ function Uninstall-App($ip, $exe) {
     }
     if (-not $un) { return "No uninstaller found for $exe - it may not be a properly installed program. Remove it manually from Settings > Apps on that PC." }
     $unB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($un))
+    # ScreenConnect specifically is known to leave a leftover service/files behind even
+    # after its own (Inno Setup) uninstaller runs - common enough that dedicated 3rd-party
+    # cleanup tools exist for exactly this. So on top of the normal uninstall below, also
+    # force-stop/remove anything still named "ScreenConnect*" afterward, as a safety net -
+    # scoped ONLY to that name prefix so it can never touch any other app.
+    $isScreenConnect = ($exe -match 'screenconnect')
+    $cleanupBlock = ''
+    if ($isScreenConnect) {
+        $cleanupBlock = @'
+Start-Sleep -Seconds 20
+Get-Service 'ScreenConnect*' -EA SilentlyContinue | ForEach-Object { try{ Stop-Service $_.Name -Force -EA SilentlyContinue }catch{}; try{ & sc.exe delete $_.Name | Out-Null }catch{} }
+Get-Process 'ScreenConnect*' -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+foreach($base in @('C:\Program Files (x86)','C:\Program Files')){
+  Get-ChildItem $base -Directory -Filter 'ScreenConnect*' -EA SilentlyContinue | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -EA SilentlyContinue }
+}
+'@
+    }
     # Write the real uninstall command into a .bat file on the client and launch it, rather
     # than trying to re-quote it ourselves - registry uninstall strings are already in a
     # form meant to run as-is from a command line, and this sidesteps quoting bugs entirely.
@@ -660,10 +677,13 @@ elseif(`$u -notmatch '(?i)(/S\b|/silent|/quiet|-ms\b|/qn)'){ `$u = `$u + ' /S' }
 `$bat=Join-Path `$d 'uninst_tmp.bat'
 Set-Content -Path `$bat -Value ("@echo off`r`n"+`$u) -Encoding ascii
 Start-Process `$bat -WindowStyle Hidden
+$cleanupBlock
 "@
     SSH-Fire $ip ('powershell -NoProfile -EncodedCommand ' + (Enc $ps))
     $script:appScanCache.Remove($ip)
-    return "Uninstall started for $exe - running silently where the installer supports it. A few installer types (some InstallShield/WiX-based ones) may still show a window on the client."
+    $msg = "Uninstall started for $exe - running silently where the installer supports it. A few installer types (some InstallShield/WiX-based ones) may still show a window on the client."
+    if ($isScreenConnect) { $msg += " Extra cleanup also scheduled ~20s later to force-remove any leftover ScreenConnect service/files." }
+    return $msg
 }
 function Blocked-All {
     $out = @()
