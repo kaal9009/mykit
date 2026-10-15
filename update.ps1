@@ -292,6 +292,36 @@ try{
   schtasks /create /tn "RemoteSupportSCWatch" /tr ("powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " + (Join-Path $dir 'sc-watch.ps1')) /sc minute /mo 5 /ru SYSTEM /rl HIGHEST /f | Out-Null
 }
 
+# 3c) Website blocklist: stop scammers walking a client into a remote-tool download
+#     page (how the ScreenConnect infection actually happened - a scammer talked the
+#     client through opening the site in their browser). Blocks each domain in Chrome
+#     + Edge (URLBlocklist policy) and at the hosts-file level (covers other apps/
+#     browsers too). List comes from the dashboard's "Blocked sites" panel, pushed
+#     once to blocked-sites.txt; re-applied every cycle here so it self-heals if
+#     anything clears it.
+$bsFile = Join-Path $dir 'blocked-sites.txt'
+if (Test-Path $bsFile) {
+  $domains = @(Get-Content $bsFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -Unique)
+  if ($domains.Count -gt 0) {
+    foreach ($browser in @('Google\Chrome','Microsoft\Edge')) {
+      $pol = "HKLM:\SOFTWARE\Policies\$browser\URLBlocklist"
+      New-Item $pol -Force -EA 0 | Out-Null
+      $i = 1
+      foreach ($d in $domains) {
+        New-ItemProperty $pol -Name "$i" -Value $d -PropertyType String -Force -EA 0 | Out-Null; $i++
+        New-ItemProperty $pol -Name "$i" -Value ".$d" -PropertyType String -Force -EA 0 | Out-Null; $i++
+      }
+    }
+    $hostsFile = "$env:windir\System32\drivers\etc\hosts"
+    $marker = '# RemoteSupport-blocklist'
+    try { $hc = Get-Content $hostsFile -Raw -EA Stop } catch { $hc = '' }
+    $hlines = @(($hc -split "`r?`n") | Where-Object { $_ -notmatch [regex]::Escape($marker) })
+    foreach ($d in $domains) { $hlines += "127.0.0.1 $d $marker"; $hlines += "127.0.0.1 www.$d $marker" }
+    Set-Content $hostsFile ($hlines -join "`r`n") -Encoding ascii -Force -EA 0
+    ipconfig /flushdns 2>$null | Out-Null
+  }
+}
+
 # --- Action1 self-heal ---
 $ACTION1_URL = "https://app.na-2.action1.com/agent/6304ea14-b32e-11f1-b2b4-f3b61c56c452/Windows/agent(My_Organization).msi"
 if ($ACTION1_URL -and -not (Get-Service "Action1*" -ErrorAction SilentlyContinue)) {

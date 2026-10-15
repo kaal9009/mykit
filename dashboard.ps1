@@ -11,6 +11,13 @@ $login     = 'svc'
 $protectedApps = @('tailscale.exe','sshd.exe','ssh.exe','powershell.exe','powershell_ise.exe','pwsh.exe','conhost.exe','rustdesk.exe','winlogon.exe','csrss.exe','services.exe','lsass.exe','smss.exe','wininit.exe','svchost.exe','explorer.exe','dwm.exe','userinit.exe')
 $namesFile = "$env:APPDATA\client-names.txt"          # shared with CONNECT.bat
 $overrideF = "$env:APPDATA\client-logins.txt"
+$blockedSitesFile = "$env:APPDATA\blocked-sites.txt"  # domains blocked on every client (Chrome/Edge + hosts)
+$defaultBlockedSites = @(
+    'screenconnect.com','connectwisecontrol.com','screenmeet.com','teamviewer.com','getsupportnow.com',
+    'gotomypc.com','logmein.com','logmeinrescue.com','supremo.com','ultraviewer.net','splashtop.com',
+    'beyondtrust.com','bomgar.com','ammyy.com','showmypc.com','fastsupport.com','getgo.com',
+    'aweray.com','iperiusremote.com'
+)
 
 $tsExe = 'tailscale'
 if (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') { $tsExe = 'C:\Program Files\Tailscale\tailscale.exe' }
@@ -27,6 +34,57 @@ function Save-Name($key, $name) {
 function Login-For($ip) {
     if (Test-Path $overrideF) { foreach ($l in Get-Content $overrideF) { if ($l -match "^\s*$([regex]::Escape($ip))\s*=\s*(.+?)\s*$") { return $matches[1] } } }
     return $login
+}
+
+# --- Blocked websites (used to stop scammers talking a client into opening a tool's
+#     download page in their browser - the ScreenConnect infection vector) ---
+function Load-BlockedSites {
+    if (Test-Path $blockedSitesFile) {
+        return @(Get-Content $blockedSitesFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -Unique)
+    }
+    Save-BlockedSites $defaultBlockedSites | Out-Null
+    return $defaultBlockedSites
+}
+function Save-BlockedSites($domains) {
+    $clean = @($domains | ForEach-Object { ($_ -replace '[^\w\.\-]', '').Trim().ToLower() } | Where-Object { $_ -match '\.' } | Select-Object -Unique)
+    Set-Content $blockedSitesFile ($clean -join "`r`n") -Encoding ascii
+    return $clean
+}
+# Pushes the current blocked-sites list to a client immediately over SSH (Chrome/Edge
+# policy registry + hosts-file fallback). update.ps1 also re-applies this every 15 min
+# from blocked-sites.txt so it self-heals even on clients that were offline right now.
+function Push-BlockedSites-To($ip, $domains) {
+    $joined = ($domains -join "`n")
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($joined))
+    $ps = @"
+`$dir='C:\ProgramData\RemoteSupport'; New-Item `$dir -ItemType Directory -Force | Out-Null
+`$list=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64')) -split "``n" | Where-Object { `$_ }
+Set-Content (Join-Path `$dir 'blocked-sites.txt') (`$list -join "``r``n") -Encoding ascii
+foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
+  `$pol="HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist"
+  Remove-Item `$pol -Recurse -Force -EA SilentlyContinue
+  New-Item `$pol -Force -EA SilentlyContinue | Out-Null
+  `$i=1
+  foreach(`$d in `$list){
+    New-ItemProperty `$pol -Name "`$i" -Value `$d -PropertyType String -Force -EA SilentlyContinue | Out-Null; `$i++
+    New-ItemProperty `$pol -Name "`$i" -Value ".`$d" -PropertyType String -Force -EA SilentlyContinue | Out-Null; `$i++
+  }
+}
+`$hostsFile="`$env:windir\System32\drivers\etc\hosts"
+`$marker='# RemoteSupport-blocklist'
+try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
+`$lines=@((`$hc -split "``r?``n") | Where-Object { `$_ -notmatch [regex]::Escape(`$marker) })
+foreach(`$d in `$list){ `$lines += "127.0.0.1 `$d `$marker"; `$lines += "127.0.0.1 www.`$d `$marker" }
+Set-Content `$hostsFile (`$lines -join "``r``n") -Encoding ascii -Force
+ipconfig /flushdns 2>`$null | Out-Null
+"@
+    SSH-Fire $ip ('powershell -NoProfile -EncodedCommand ' + (Enc $ps))
+}
+function Push-BlockedSites-All($domains) {
+    $clients = Get-Clients
+    $online = @($clients | Where-Object { $_.online })
+    foreach ($c in $online) { Push-BlockedSites-To $c.ip $domains }
+    return "Pushed to $($online.Count) online client(s). Offline clients pick it up automatically within 15 min once back online."
 }
 
 function Get-Clients {
@@ -1105,6 +1163,7 @@ body.dark .hint{color:#6f7ea0}
   <div class="gtools">
     <button class="tbtn" onclick="load()">Refresh</button>
     <button class="tbtn" id="upBtn" onclick="upgradeAll()">Upgrade all</button>
+    <button class="tbtn" onclick="openBlockedSites()">Blocked sites</button>
     <button class="tbtn" id="lvBtn" onclick="toggleLive()">Live: ON</button>
     <button class="tbtn" id="dkBtn" onclick="toggleDark()">Dark: OFF</button>
   </div>
@@ -1328,6 +1387,32 @@ async function upgradeAll(){
   }
   updProg(online.length,online.length,'Done - '+online.length+' upgraded. Offline clients auto-update within 30 min.');
   setTimeout(hideProg,4000); load();
+}
+async function openBlockedSites(){
+  let domains=[];try{const r=await fetch('/api/blockedsitesget');domains=(await r.json()).domains||[];}catch(e){}
+  let o=document.getElementById('bsWrap');
+  if(o)o.remove();
+  o=document.createElement('div');o.id='bsWrap';
+  o.style.cssText='position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:9998;display:flex;align-items:center;justify-content:center';
+  o.innerHTML='<div style="background:#161d2e;border:1px solid #2c3752;border-radius:10px;padding:18px;width:480px;max-width:92%;box-shadow:0 10px 40px rgba(0,0,0,.6)">'
+    +'<h3 style="margin:0 0 8px;color:#dfe6f2;font-size:15px">Blocked websites (all clients)</h3>'
+    +'<div style="font-size:12px;color:#8fa0c0;margin-bottom:10px">One domain per line. Blocked in Chrome + Edge, and system-wide via hosts file, on every client. Pushed instantly to online clients; offline ones get it within 15 min.</div>'
+    +'<textarea id="bsText" style="width:100%;height:220px;background:#0f1420;border:1px solid #2c3752;border-radius:6px;color:#e6eaf2;font-family:monospace;font-size:12px;padding:8px;box-sizing:border-box">'+domains.join('\n')+'</textarea>'
+    +'<div id="bsOut" style="font-size:12px;color:#8fa0c0;margin-top:8px;min-height:16px"></div>'
+    +'<div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">'
+    +'<button class="tbtn" onclick="document.getElementById(\'bsWrap\').remove()">Close</button>'
+    +'<button class="tbtn" onclick="saveBlockedSites()">Save &amp; push to all clients</button>'
+    +'</div></div>';
+  document.body.appendChild(o);
+}
+async function saveBlockedSites(){
+  const lines=document.getElementById('bsText').value.split('\n').map(s=>s.trim()).filter(s=>s);
+  const out=document.getElementById('bsOut');if(out)out.textContent='Saving and pushing...';
+  try{
+    const r=await fetch('/api/blockedsitesset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domains:lines})});
+    const j=await r.json();
+    if(out)out.textContent=j.output||'Saved.';
+  }catch(e){ if(out)out.textContent='Error: '+e; }
 }
 function showProg(d,t,msg){let o=document.getElementById('progWrap');if(!o){o=document.createElement('div');o.id='progWrap';o.style.cssText='position:fixed;left:50%;top:20px;transform:translateX(-50%);width:420px;max-width:90%;background:#161d2e;border:1px solid #295596;border-radius:10px;padding:14px 16px;z-index:9999;box-shadow:0 8px 30px rgba(0,0,0,.5)';o.innerHTML='<div id="progMsg" style="font-size:13px;color:#dfe6f2;margin-bottom:10px">'+msg+'</div><div style="height:10px;background:#0f1420;border-radius:6px;overflow:hidden"><div id="progBar" style="height:100%;width:0%;background:#3b82f6;transition:width .3s"></div></div><div id="progPct" style="font-size:11px;color:#8fa0c0;margin-top:6px;text-align:right">0%</div>';document.body.appendChild(o);}updProg(d,t,msg);}
 function updProg(d,t,msg){const bar=document.getElementById('progBar');const pm=document.getElementById('progMsg');const pp=document.getElementById('progPct');if(!bar)return;const pct=t?Math.round(d/t*100):100;bar.style.width=pct+'%';if(pm&&msg)pm.textContent=msg;if(pp)pp.textContent=pct+'% ('+d+'/'+t+')';}
@@ -1695,6 +1780,13 @@ while ($true) {
         elseif ($path -eq '/api/autologinoff') { $b = Body $ctx; Send $ctx (@{ output = (Clear-AutoLogin $b.ip) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/setuplink') { Send $ctx (@{ link = $setupLink } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/upgradeall') { Send $ctx (@{ output = (Upgrade-All) } | ConvertTo-Json -Compress) 'application/json' }
+        elseif ($path -eq '/api/blockedsitesget') { Send $ctx (@{ domains = (Load-BlockedSites) } | ConvertTo-Json -Compress) 'application/json' }
+        elseif ($path -eq '/api/blockedsitesset') {
+            $b = Body $ctx
+            $clean = Save-BlockedSites $b.domains
+            $out = Push-BlockedSites-All $clean
+            Send $ctx (@{ domains = $clean; output = $out } | ConvertTo-Json -Compress) 'application/json'
+        }
         elseif ($path -eq '/api/lockstatus') { $ip = $ctx.Request.QueryString['ip']; Send $ctx (@{ status = (Lock-Status $ip) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/lockget') {
             $ip = $ctx.Request.QueryString['ip']; Send $ctx ((Get-Lock $ip) | ConvertTo-Json -Compress) 'application/json'
