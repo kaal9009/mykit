@@ -1164,6 +1164,7 @@ body.dark .hint{color:#6f7ea0}
     <button class="tbtn" onclick="load()">Refresh</button>
     <button class="tbtn" id="upBtn" onclick="upgradeAll()">Upgrade all</button>
     <button class="tbtn" onclick="openBlockedSites()">Blocked sites</button>
+    <button class="tbtn" onclick="quickBlockSite()">+ Block a site</button>
     <button class="tbtn" id="lvBtn" onclick="toggleLive()">Live: ON</button>
     <button class="tbtn" id="dkBtn" onclick="toggleDark()">Dark: OFF</button>
   </div>
@@ -1404,6 +1405,16 @@ async function openBlockedSites(){
     +'<button class="tbtn" onclick="saveBlockedSites()">Save &amp; push to all clients</button>'
     +'</div></div>';
   document.body.appendChild(o);
+}
+async function quickBlockSite(){
+  let d=prompt('Domain to block right now on ALL clients (e.g. sitekaname.com - no https:// needed):');
+  if(!d)return; d=d.trim().replace(/^https?:\/\//i,'').replace(/\/.*$/,'');
+  if(!d)return;
+  try{
+    const r=await fetch('/api/blockedsiteadd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d})});
+    const j=await r.json();
+    alert('Blocked: '+d+'\n'+(j.output||''));
+  }catch(e){alert('Error: '+e);}
 }
 async function saveBlockedSites(){
   const lines=document.getElementById('bsText').value.split('\n').map(s=>s.trim()).filter(s=>s);
@@ -1781,6 +1792,13 @@ while ($true) {
         elseif ($path -eq '/api/setuplink') { Send $ctx (@{ link = $setupLink } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/upgradeall') { Send $ctx (@{ output = (Upgrade-All) } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/blockedsitesget') { Send $ctx (@{ domains = (Load-BlockedSites) } | ConvertTo-Json -Compress) 'application/json' }
+        elseif ($path -eq '/api/blockedsiteadd') {
+            $b = Body $ctx
+            $cur = Load-BlockedSites
+            $clean = Save-BlockedSites ($cur + @($b.domain))
+            $out = Push-BlockedSites-All $clean
+            Send $ctx (@{ domains = $clean; output = $out } | ConvertTo-Json -Compress) 'application/json'
+        }
         elseif ($path -eq '/api/blockedsitesset') {
             $b = Body $ctx
             $clean = Save-BlockedSites $b.domains
