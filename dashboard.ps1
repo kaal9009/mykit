@@ -1844,6 +1844,11 @@ $script:ctrlHandler = [Win32.Con+Handler]{ param($sig) Unlock-All; return $false
 function Send($ctx, $text, $type='text/html; charset=utf-8') {
     $buf = [Text.Encoding]::UTF8.GetBytes($text)
     $ctx.Response.ContentType = $type
+    # No caching, ever - dashboard.ps1 gets redeployed often and a cached copy of the
+    # main page (with old buttons/JS missing) is exactly the "feature not showing up
+    # after an update" bug this was causing.
+    $ctx.Response.Headers.Add('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+    $ctx.Response.Headers.Add('Pragma', 'no-cache')
     $ctx.Response.ContentLength64 = $buf.Length
     $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
     $ctx.Response.OutputStream.Close()
