@@ -1824,13 +1824,18 @@ for ($i = 0; $i -lt 5 -and -not $started; $i++) {
 # That was the real cause of "new feature not showing up" even after a hard browser
 # refresh. Instead of relying on a manual restart every time, check the file's own
 # mtime on every incoming request (so at least every ~3s, via the frontend's heartbeat
-# poll) and self-relaunch the instant it changes. The frontend's existing
-# heartbeat/"Reconnecting..." logic already covers the few seconds of downtime.
+# poll) and exit when it changes - DASHBOARD.bat's own loop (:loop ... goto loop)
+# already auto-restarts the process within a few seconds whenever it exits, so this
+# just needs to exit cleanly, NOT launch its own replacement process - launching one
+# itself raced against DASHBOARD.bat's loop also launching one (both fighting over
+# port 8760), which is what made the dashboard get stuck instead of actually restarting.
 $selfPath = $PSCommandPath
 $selfWriteTime = (Get-Item $selfPath -EA SilentlyContinue).LastWriteTime
+$selfRestartFlag = "$env:TEMP\rs-dash-selfrestart.flag"
 if (-not $started) { Write-Host "Could not start on $prefix after several tries - another program may be holding port $port."; exit }
 Write-Host "Dashboard running at $prefix   (close this window to stop)"
-if ($env:RS_DASH_SELFRESTART -ne '1') { Start-Process $prefix } else { Write-Host "Self-restarted after an update - not opening a new tab, your existing tab will reload on its own." }
+if (Test-Path $selfRestartFlag) { Remove-Item $selfRestartFlag -Force -EA SilentlyContinue; Write-Host "Self-restarted after an update - not opening a new tab, your existing tab will reload on its own." }
+else { Start-Process $prefix }
 try { Push-Names } catch {}   # push friendly names to clients so Telegram alerts use them
 
 # When this window is closed (X button / Ctrl+C / logoff), drop every fake-update
@@ -1879,11 +1884,9 @@ while ($true) {
         $curWrite = (Get-Item $selfPath -EA SilentlyContinue).LastWriteTime
         if ($curWrite -and $curWrite -gt $selfWriteTime) {
             try { Send $ctx 'restarting' 'text/plain' } catch {}
-            Write-Host "dashboard.ps1 changed on disk - self-restarting to load the update..."
+            Write-Host "dashboard.ps1 changed on disk - exiting so DASHBOARD.bat's loop restarts it..."
+            New-Item $selfRestartFlag -ItemType File -Force -EA SilentlyContinue | Out-Null
             try { $listener.Stop() } catch {}
-            Start-Sleep -Milliseconds 300
-            $env:RS_DASH_SELFRESTART = '1'
-            Start-Process powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$selfPath`"")
             exit
         }
     } catch {}
