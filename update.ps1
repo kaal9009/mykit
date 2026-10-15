@@ -210,7 +210,15 @@ if(-not $ts){ exit }
 $selfIp=(& $ts ip -4 2>$null | Select-Object -First 1)
 $j=& $ts status --json | ConvertFrom-Json
 $nodes=@();$peers=@{}
-foreach($p in $j.Peer.PSObject.Properties.Value){ $peers[$p.HostName]=[bool]$p.Online; if($p.Online){ $nodes+=$p.TailscaleIPs[0] } }
+# Reporter election is based on ALL known peers (online or offline), NOT just
+# currently-online ones. Electing from only the online set makes the "reporter"
+# role jump between different machines as peers flap online/offline - and since
+# each machine keeps its OWN local tg-state.txt, a role-switch compares against
+# a different (stale) history and fires false ONLINE/OFFLINE alerts even when
+# nothing really changed. Using the full peer set keeps the reporter fixed to
+# one machine (whoever has the lowest Tailscale IP tailnet-wide) regardless of
+# who else is flapping.
+foreach($p in $j.Peer.PSObject.Properties.Value){ $peers[$p.HostName]=[bool]$p.Online; if($p.TailscaleIPs){ $nodes+=$p.TailscaleIPs[0] } }
 $nodes+=$selfIp
 $reporter=($nodes | Sort-Object | Select-Object -First 1)
 if($selfIp -ne $reporter){ exit }
