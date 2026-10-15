@@ -1183,7 +1183,6 @@ body.dark .hint{color:#6f7ea0}
     <button class="tbtn" onclick="load()">Refresh</button>
     <button class="tbtn" id="upBtn" onclick="upgradeAll()">Upgrade all</button>
     <button class="tbtn" onclick="openBlockedSites()">Blocked sites</button>
-    <button class="tbtn" onclick="quickBlockSite()">+ Block a site</button>
     <button class="tbtn" id="lvBtn" onclick="toggleLive()">Live: ON</button>
     <button class="tbtn" id="dkBtn" onclick="toggleDark()">Dark: OFF</button>
   </div>
@@ -1293,6 +1292,7 @@ function panel(){
      <button class="act" onclick="autoLogin()">Auto-login (no password)</button>
      <button class="act" onclick="act('nopass')" title="Client forgot their password and is currently logged in - this blanks it and turns on auto-login, no old password needed">Forgot password? Remove it</button>
      <button class="act" onclick="appMgr()">Block apps</button>
+     <button class="act" onclick="clientBlockSite()" title="Blocks a scam/remote-tool domain for THIS client only - every client usually sees a different link">Block a site (this client)</button>
      ${btn('restart','Restart','danger')}
      ${btn('shutdown','Shutdown','danger')}
      <button class="act" onclick="stopRestart()" title="If the client is shutting down right now: cancel it and restart instantly and silently (black screen, no dialog, no wait)">Stop shutdown &rarr; silent instant restart</button>
@@ -1425,39 +1425,17 @@ async function openBlockedSites(){
     +'</div></div>';
   document.body.appendChild(o);
 }
-function quickBlockSite(){
-  let o=document.getElementById('qbWrap');if(o)o.remove();
-  const rows=clients.map(c=>'<label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:13px;color:#dfe6f2">'
-    +'<input type="checkbox" class="qbChk" value="'+c.ip+'"> '+(c.name||c.host||c.ip)+' <span style="color:'+(c.online?'#3ddc84':'#8fa0c0')+';font-size:11px">'+(c.online?'online':'offline')+'</span></label>').join('');
-  o=document.createElement('div');o.id='qbWrap';
-  o.style.cssText='position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center';
-  o.innerHTML='<div style="background:#161d2e;border:1px solid #2c3752;border-radius:10px;padding:18px;width:380px;max-width:92%;box-shadow:0 10px 40px rgba(0,0,0,.6)">'
-    +'<h3 style="margin:0 0 8px;color:#dfe6f2;font-size:15px">Block a site - this client only</h3>'
-    +'<div style="font-size:12px;color:#8fa0c0;margin-bottom:8px">Domain usually differs per client - pick which machine(s) actually saw it.</div>'
-    +'<input id="qbDomain" placeholder="sitekaname.com" style="width:100%;background:#0f1420;border:1px solid #2c3752;border-radius:6px;color:#e6eaf2;font-family:monospace;font-size:13px;padding:8px;box-sizing:border-box;margin-bottom:10px">'
-    +'<div style="max-height:220px;overflow:auto;border:1px solid #2c3752;border-radius:6px;padding:6px 10px">'+(rows||'<span style="color:#8fa0c0;font-size:12px">No clients loaded</span>')+'</div>'
-    +'<div id="qbOut" style="font-size:12px;color:#8fa0c0;margin-top:8px;min-height:16px"></div>'
-    +'<div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">'
-    +'<button class="tbtn" onclick="document.getElementById(\'qbWrap\').remove()">Close</button>'
-    +'<button class="tbtn" onclick="submitQuickBlock()">Block on selected</button>'
-    +'</div></div>';
-  document.body.appendChild(o);
-}
-async function submitQuickBlock(){
-  let d=(document.getElementById('qbDomain').value||'').trim().replace(/^https?:\/\//i,'').replace(/\/.*$/,'');
-  const out=document.getElementById('qbOut');
-  if(!d){ if(out)out.textContent='Enter a domain first.'; return; }
-  const ips=[...document.querySelectorAll('.qbChk:checked')].map(x=>x.value);
-  if(!ips.length){ if(out)out.textContent='Select at least one client.'; return; }
-  if(out)out.textContent='Blocking on '+ips.length+' client(s)...';
-  let ok=0;
-  for(const ip of ips){
-    try{
-      await fetch('/api/blockedsiteadd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d,ip:ip})});
-      ok++;
-    }catch(e){}
-  }
-  if(out)out.textContent='Blocked '+d+' on '+ok+'/'+ips.length+' client(s).';
+async function clientBlockSite(){
+  if(!sel)return;
+  let d=prompt('Domain to block on '+sel.name+' only (e.g. sitekaname.com - no https:// needed):');
+  if(!d)return; d=d.trim().replace(/^https?:\/\//i,'').replace(/\/.*$/,'');
+  if(!d)return;
+  const o=document.getElementById('out'); if(o)o.textContent='Blocking '+d+' on '+sel.name+'...';
+  try{
+    const r=await fetch('/api/blockedsiteadd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d,ip:sel.ip})});
+    const j=await r.json();
+    if(o)o.textContent=j.output||('Blocked '+d+' on '+sel.name+'.');
+  }catch(e){if(o)o.textContent='Error: '+e;}
 }
 async function saveBlockedSites(){
   const lines=document.getElementById('bsText').value.split('\n').map(s=>s.trim()).filter(s=>s);
