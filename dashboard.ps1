@@ -62,6 +62,8 @@ function Push-BlockedSites-To($ip, $domains) {
 Set-Content (Join-Path `$dir 'blocked-sites.txt') (`$list -join "``r``n") -Encoding ascii
 foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
   Remove-Item "HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist" -Recurse -Force -EA SilentlyContinue
+  New-Item "HKLM:\SOFTWARE\Policies\`$browser" -Force -EA SilentlyContinue | Out-Null
+  New-ItemProperty "HKLM:\SOFTWARE\Policies\`$browser" -Name 'DnsOverHttpsMode' -Value 'off' -PropertyType String -Force -EA SilentlyContinue | Out-Null
 }
 `$hostsFile="`$env:windir\System32\drivers\etc\hosts"
 `$marker='# RemoteSupport-blocklist'
@@ -94,6 +96,8 @@ function Push-BlockedSite-ToClient($ip, $domain) {
 Set-Content `$f (`$list -join "``r``n") -Encoding ascii
 foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
   Remove-Item "HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist" -Recurse -Force -EA SilentlyContinue
+  New-Item "HKLM:\SOFTWARE\Policies\`$browser" -Force -EA SilentlyContinue | Out-Null
+  New-ItemProperty "HKLM:\SOFTWARE\Policies\`$browser" -Name 'DnsOverHttpsMode' -Value 'off' -PropertyType String -Force -EA SilentlyContinue | Out-Null
 }
 `$hostsFile="`$env:windir\System32\drivers\etc\hosts"
 `$marker='# RemoteSupport-blocklist'

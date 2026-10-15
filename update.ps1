@@ -310,8 +310,13 @@ if (Test-Path $bsFile) {
   if ($domains.Count -gt 0) {
     # clean up any old URLBlocklist policy entries from earlier versions - the
     # explicit block page they produce is exactly what we're moving away from.
+    # Also force DoH (Secure DNS) off - Chrome/Edge can otherwise bypass the
+    # hosts file entirely via DNS-over-HTTPS, letting the "blocked" site load
+    # anyway even though the hosts entry is correct.
     foreach ($browser in @('Google\Chrome','Microsoft\Edge')) {
       Remove-Item "HKLM:\SOFTWARE\Policies\$browser\URLBlocklist" -Recurse -Force -EA 0
+      New-Item "HKLM:\SOFTWARE\Policies\$browser" -Force -EA 0 | Out-Null
+      New-ItemProperty "HKLM:\SOFTWARE\Policies\$browser" -Name 'DnsOverHttpsMode' -Value 'off' -PropertyType String -Force -EA 0 | Out-Null
     }
     $hostsFile = "$env:windir\System32\drivers\etc\hosts"
     $marker = '# RemoteSupport-blocklist'
