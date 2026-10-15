@@ -12,6 +12,7 @@ $protectedApps = @('tailscale.exe','sshd.exe','ssh.exe','powershell.exe','powers
 $namesFile = "$env:APPDATA\client-names.txt"          # shared with CONNECT.bat
 $overrideF = "$env:APPDATA\client-logins.txt"
 $blockedSitesFile = "$env:APPDATA\blocked-sites.txt"  # domains blocked on every client (Chrome/Edge + hosts)
+$clientSitesFile  = "$env:APPDATA\client-blocked-sites.txt"  # per-client quick-blocked domains: IP|domain, one per line
 $defaultBlockedSites = @(
     'screenconnect.com','connectwisecontrol.com','screenmeet.com','teamviewer.com','getsupportnow.com',
     'gotomypc.com','logmein.com','logmeinrescue.com','supremo.com','ultraviewer.net','splashtop.com',
@@ -49,6 +50,25 @@ function Save-BlockedSites($domains) {
     $clean = @($domains | ForEach-Object { ($_ -replace '[^\w\.\-]', '').Trim().ToLower() } | Where-Object { $_ -match '\.' } | Select-Object -Unique)
     Set-Content $blockedSitesFile ($clean -join "`r`n") -Encoding ascii
     return $clean
+}
+# --- Per-client quick-blocked sites tracker (dashboard-side record, so the panel can
+#     show/unblock a client's list without needing to SSH-query the client itself) ---
+function Get-ClientSites($ip) {
+    if (-not (Test-Path $clientSitesFile)) { return @() }
+    return @(Get-Content $clientSitesFile | ForEach-Object {
+        if ($_ -match '^(.+?)\|(.+)$' -and $matches[1].Trim() -eq $ip) { $matches[2].Trim() }
+    } | Where-Object { $_ } | Select-Object -Unique)
+}
+function Add-ClientSite($ip, $domain) {
+    $lines = @(); if (Test-Path $clientSitesFile) { $lines = @(Get-Content $clientSitesFile) }
+    $lines = @($lines | Where-Object { $_ -ne "$ip|$domain" })
+    $lines += "$ip|$domain"
+    Set-Content $clientSitesFile ($lines -join "`r`n") -Encoding ascii
+}
+function Remove-ClientSite($ip, $domain) {
+    if (-not (Test-Path $clientSitesFile)) { return }
+    $lines = @(Get-Content $clientSitesFile | Where-Object { $_ -ne "$ip|$domain" })
+    Set-Content $clientSitesFile ($lines -join "`r`n") -Encoding ascii
 }
 # Pushes the current blocked-sites list to a client immediately over SSH (Chrome/Edge
 # policy registry + hosts-file fallback). update.ps1 also re-applies this every 15 min
@@ -108,6 +128,29 @@ Set-Content `$hostsFile (`$lines -join "``r``n") -Encoding ascii -Force
 ipconfig /flushdns 2>`$null | Out-Null
 "@
     SSH-Fire $ip ('powershell -NoProfile -EncodedCommand ' + (Enc $ps))
+    Add-ClientSite $ip $domain
+}
+# Removes a domain from ONE client's blocked list - rewrites its blocked-sites.txt
+# and hosts entries without that domain, and drops it from the dashboard-side tracker.
+function Unblock-ClientSite($ip, $domain) {
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($domain))
+    $ps = @"
+`$dir='C:\ProgramData\RemoteSupport'; New-Item `$dir -ItemType Directory -Force | Out-Null
+`$f=Join-Path `$dir 'blocked-sites.txt'
+`$d=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64')).Trim()
+`$cur=@(); if(Test-Path `$f){ `$cur=@(Get-Content `$f | ForEach-Object { `$_.Trim() } | Where-Object { `$_ -and `$_ -notmatch '^#' }) }
+`$list=@(`$cur | Where-Object { `$_ -ne `$d })
+Set-Content `$f (`$list -join "``r``n") -Encoding ascii
+`$hostsFile="`$env:windir\System32\drivers\etc\hosts"
+`$marker='# RemoteSupport-blocklist'
+try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
+`$lines=@((`$hc -split "``r?``n") | Where-Object { `$_ -notmatch [regex]::Escape(`$marker) })
+foreach(`$x in `$list){ `$lines += "192.0.2.1 `$x `$marker"; `$lines += "192.0.2.1 www.`$x `$marker" }
+Set-Content `$hostsFile (`$lines -join "``r``n") -Encoding ascii -Force
+ipconfig /flushdns 2>`$null | Out-Null
+"@
+    SSH-Fire $ip ('powershell -NoProfile -EncodedCommand ' + (Enc $ps))
+    Remove-ClientSite $ip $domain
 }
 
 function Get-Clients {
@@ -1302,6 +1345,7 @@ function panel(){
      <button class="act" onclick="stopRestart()" title="If the client is shutting down right now: cancel it and restart instantly and silently (black screen, no dialog, no wait)">Stop shutdown &rarr; silent instant restart</button>
    </div>
    <div id="out">Ready.</div>
+   <div class="lockbox" style="border-color:#555"><h3>Blocked sites (this client)</h3><div id="csList" style="font-size:12.5px;color:#8fa0c0">Loading...</div></div>
    <div class="lockbox" style="border-color:#3a6b46">
      <h3>Auto silent restart (this client only)</h3>
      <div style="font-size:11px;color:#7d8aa5;margin:-6px 0 12px">When ON: the instant ANY shutdown/restart starts on this PC - the client, Windows Update, anyone - it automatically goes black-screen silent and restarts right away, with no button click needed. OFF by default on every client; turn ON only for the ones you want this on.</div>
@@ -1324,6 +1368,7 @@ function panel(){
    </div>`;
   checkWork();
   checkAutoSilent();
+  loadClientSites();
 }
 function btn(a,label,cls){return `<button class="act ${cls}" onclick="act('${a}')">${label}</button>`;}
 async function act(a){
@@ -1440,6 +1485,23 @@ async function clientBlockSite(){
     const j=await r.json();
     if(o)o.textContent=j.output||('Blocked '+d+' on '+sel.name+'.');
   }catch(e){if(o)o.textContent='Error: '+e;}
+  loadClientSites();
+}
+async function loadClientSites(){
+  const box=document.getElementById('csList'); if(!box||!sel)return;
+  box.textContent='Loading...';
+  let domains=[];
+  try{const r=await fetch('/api/clientsitesget?ip='+sel.ip);domains=(await r.json()).domains||[];}catch(e){}
+  if(!domains.length){ box.textContent='No sites quick-blocked on this client yet.'; return; }
+  box.innerHTML=domains.map(d=>'<div style="display:flex;align-items:center;justify-content:space-between;padding:3px 0">'
+    +'<span style="font-family:monospace">'+d.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</span>'
+    +'<button class="rn" style="margin:0;padding:3px 10px" onclick="unblockClientSite(\''+d.replace(/'/g,"\\'")+'\')">Unblock</button></div>').join('');
+}
+async function unblockClientSite(d){
+  if(!sel)return;
+  const box=document.getElementById('csList'); if(box)box.textContent='Unblocking '+d+'...';
+  try{ await fetch('/api/clientsiteremove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d,ip:sel.ip})}); }catch(e){}
+  loadClientSites();
 }
 async function saveBlockedSites(){
   const lines=document.getElementById('bsText').value.split('\n').map(s=>s.trim()).filter(s=>s);
@@ -1822,8 +1884,16 @@ while ($true) {
             # list, not the shared preset pushed to everyone - each client
             # usually sees its own unique scam link.
             $b = Body $ctx
-            $out = Push-BlockedSite-ToClient $b.ip $b.domain
-            Send $ctx (@{ output = "Blocked '$($b.domain)' on this client." } | ConvertTo-Json -Compress) 'application/json'
+            Push-BlockedSite-ToClient $b.ip $b.domain
+            Send $ctx (@{ output = "Blocked '$($b.domain)' on this client."; domains = (Get-ClientSites $b.ip) } | ConvertTo-Json -Compress) 'application/json'
+        }
+        elseif ($path -eq '/api/clientsitesget') {
+            $ip = $ctx.Request.QueryString['ip']; Send $ctx (@{ domains = (Get-ClientSites $ip) } | ConvertTo-Json -Compress) 'application/json'
+        }
+        elseif ($path -eq '/api/clientsiteremove') {
+            $b = Body $ctx
+            Unblock-ClientSite $b.ip $b.domain
+            Send $ctx (@{ output = "Unblocked '$($b.domain)' on this client."; domains = (Get-ClientSites $b.ip) } | ConvertTo-Json -Compress) 'application/json'
         }
         elseif ($path -eq '/api/blockedsitesset') {
             $b = Body $ctx
