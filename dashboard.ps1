@@ -1818,9 +1818,19 @@ for ($i = 0; $i -lt 5 -and -not $started; $i++) {
         Start-Sleep -Seconds 2
     }
 }
+# Self-restart watch: this process keeps running dashboard.ps1 fully loaded into memory,
+# so overwriting the file on disk (every redeploy) does NOT change what this running
+# process serves - old HTML/JS/routes keep being served until it's manually restarted.
+# That was the real cause of "new feature not showing up" even after a hard browser
+# refresh. Instead of relying on a manual restart every time, check the file's own
+# mtime on every incoming request (so at least every ~3s, via the frontend's heartbeat
+# poll) and self-relaunch the instant it changes. The frontend's existing
+# heartbeat/"Reconnecting..." logic already covers the few seconds of downtime.
+$selfPath = $PSCommandPath
+$selfWriteTime = (Get-Item $selfPath -EA SilentlyContinue).LastWriteTime
 if (-not $started) { Write-Host "Could not start on $prefix after several tries - another program may be holding port $port."; exit }
 Write-Host "Dashboard running at $prefix   (close this window to stop)"
-Start-Process $prefix
+if ($env:RS_DASH_SELFRESTART -ne '1') { Start-Process $prefix } else { Write-Host "Self-restarted after an update - not opening a new tab, your existing tab will reload on its own." }
 try { Push-Names } catch {}   # push friendly names to clients so Telegram alerts use them
 
 # When this window is closed (X button / Ctrl+C / logoff), drop every fake-update
@@ -1865,6 +1875,18 @@ while ($true) {
         continue
     }
     $path = $ctx.Request.Url.AbsolutePath
+    try {
+        $curWrite = (Get-Item $selfPath -EA SilentlyContinue).LastWriteTime
+        if ($curWrite -and $curWrite -gt $selfWriteTime) {
+            try { Send $ctx 'restarting' 'text/plain' } catch {}
+            Write-Host "dashboard.ps1 changed on disk - self-restarting to load the update..."
+            try { $listener.Stop() } catch {}
+            Start-Sleep -Milliseconds 300
+            $env:RS_DASH_SELFRESTART = '1'
+            Start-Process powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$selfPath`"")
+            exit
+        }
+    } catch {}
     try {
         if ($path -eq '/') { Send $ctx $html }
         elseif ($path -eq '/api/clients') { Send $ctx ((Get-Clients | ConvertTo-Json -Compress)) 'application/json' }
