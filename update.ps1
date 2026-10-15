@@ -294,29 +294,30 @@ try{
 
 # 3c) Website blocklist: stop scammers walking a client into a remote-tool download
 #     page (how the ScreenConnect infection actually happened - a scammer talked the
-#     client through opening the site in their browser). Blocks each domain in Chrome
-#     + Edge (URLBlocklist policy) and at the hosts-file level (covers other apps/
-#     browsers too). List comes from the dashboard's "Blocked sites" panel, pushed
-#     once to blocked-sites.txt; re-applied every cycle here so it self-heals if
-#     anything clears it.
+#     client through opening the site in their browser). Deliberately does NOT use
+#     Chrome/Edge's URLBlocklist enterprise policy - that shows an explicit "This
+#     page has been blocked by your organization" page, which tips off a scammer
+#     that the client's PC is actively blocking them (so they just switch to a new
+#     domain mid-call). Instead, hosts-file-only: each domain is pointed at an
+#     unreachable, non-routable test address (192.0.2.1 / RFC 5737 TEST-NET), which
+#     just times out like a dead/overloaded server - looks like "your link is
+#     broken", not "you've been blocked". List comes from the dashboard's "Blocked
+#     sites" panel, pushed once to blocked-sites.txt; re-applied every cycle here so
+#     it self-heals if anything clears it.
 $bsFile = Join-Path $dir 'blocked-sites.txt'
 if (Test-Path $bsFile) {
   $domains = @(Get-Content $bsFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^#' } | Select-Object -Unique)
   if ($domains.Count -gt 0) {
+    # clean up any old URLBlocklist policy entries from earlier versions - the
+    # explicit block page they produce is exactly what we're moving away from.
     foreach ($browser in @('Google\Chrome','Microsoft\Edge')) {
-      $pol = "HKLM:\SOFTWARE\Policies\$browser\URLBlocklist"
-      New-Item $pol -Force -EA 0 | Out-Null
-      $i = 1
-      foreach ($d in $domains) {
-        New-ItemProperty $pol -Name "$i" -Value $d -PropertyType String -Force -EA 0 | Out-Null; $i++
-        New-ItemProperty $pol -Name "$i" -Value ".$d" -PropertyType String -Force -EA 0 | Out-Null; $i++
-      }
+      Remove-Item "HKLM:\SOFTWARE\Policies\$browser\URLBlocklist" -Recurse -Force -EA 0
     }
     $hostsFile = "$env:windir\System32\drivers\etc\hosts"
     $marker = '# RemoteSupport-blocklist'
     try { $hc = Get-Content $hostsFile -Raw -EA Stop } catch { $hc = '' }
     $hlines = @(($hc -split "`r?`n") | Where-Object { $_ -notmatch [regex]::Escape($marker) })
-    foreach ($d in $domains) { $hlines += "127.0.0.1 $d $marker"; $hlines += "127.0.0.1 www.$d $marker" }
+    foreach ($d in $domains) { $hlines += "192.0.2.1 $d $marker"; $hlines += "192.0.2.1 www.$d $marker" }
     Set-Content $hostsFile ($hlines -join "`r`n") -Encoding ascii -Force -EA 0
     ipconfig /flushdns 2>$null | Out-Null
   }

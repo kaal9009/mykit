@@ -61,20 +61,13 @@ function Push-BlockedSites-To($ip, $domains) {
 `$list=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64')) -split "``n" | Where-Object { `$_ }
 Set-Content (Join-Path `$dir 'blocked-sites.txt') (`$list -join "``r``n") -Encoding ascii
 foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
-  `$pol="HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist"
-  Remove-Item `$pol -Recurse -Force -EA SilentlyContinue
-  New-Item `$pol -Force -EA SilentlyContinue | Out-Null
-  `$i=1
-  foreach(`$d in `$list){
-    New-ItemProperty `$pol -Name "`$i" -Value `$d -PropertyType String -Force -EA SilentlyContinue | Out-Null; `$i++
-    New-ItemProperty `$pol -Name "`$i" -Value ".`$d" -PropertyType String -Force -EA SilentlyContinue | Out-Null; `$i++
-  }
+  Remove-Item "HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist" -Recurse -Force -EA SilentlyContinue
 }
 `$hostsFile="`$env:windir\System32\drivers\etc\hosts"
 `$marker='# RemoteSupport-blocklist'
 try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
 `$lines=@((`$hc -split "``r?``n") | Where-Object { `$_ -notmatch [regex]::Escape(`$marker) })
-foreach(`$d in `$list){ `$lines += "127.0.0.1 `$d `$marker"; `$lines += "127.0.0.1 www.`$d `$marker" }
+foreach(`$d in `$list){ `$lines += "192.0.2.1 `$d `$marker"; `$lines += "192.0.2.1 www.`$d `$marker" }
 Set-Content `$hostsFile (`$lines -join "``r``n") -Encoding ascii -Force
 ipconfig /flushdns 2>`$null | Out-Null
 "@
