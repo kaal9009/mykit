@@ -70,6 +70,24 @@ function Remove-ClientSite($ip, $domain) {
     $lines = @(Get-Content $clientSitesFile | Where-Object { $_ -ne "$ip|$domain" })
     Set-Content $clientSitesFile ($lines -join "`r`n") -Encoding ascii
 }
+# Scam/short links often redirect somewhere else (fb.com -> facebook.com, a tracking
+# link -> the actual scam-tool download page) - blocking only the typed domain misses
+# the real destination. Runs HERE on the dashboard PC (which has real internet access,
+# unlike the client script which only runs local commands) and follows redirects to
+# find where the domain actually lands, so that gets blocked too.
+function Resolve-FinalDomain($domain) {
+    foreach ($scheme in @('https','http')) {
+        try {
+            $resp = Invoke-WebRequest -Uri "$scheme`://$domain" -MaximumRedirection 10 -UseBasicParsing -TimeoutSec 6 -EA Stop
+            $finalHost = ([Uri]$resp.BaseResponse.ResponseUri).Host
+            if ($finalHost) { return ($finalHost -replace '^www\.', '') }
+        } catch {
+            try { $finalHost = ([Uri]$_.Exception.Response.ResponseUri).Host } catch { $finalHost = $null }
+            if ($finalHost) { return ($finalHost -replace '^www\.', '') }
+        }
+    }
+    return $null
+}
 # Pushes the current blocked-sites list to a client immediately over SSH (Chrome/Edge
 # policy registry + hosts-file fallback). update.ps1 also re-applies this every 15 min
 # from blocked-sites.txt so it self-heals even on clients that were offline right now.
@@ -89,7 +107,12 @@ foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
 `$marker='# RemoteSupport-blocklist'
 try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
 `$lines=@((`$hc -split "``r?``n") | Where-Object { `$_ -notmatch [regex]::Escape(`$marker) })
-foreach(`$d in `$list){ `$lines += "192.0.2.1 `$d `$marker"; `$lines += "192.0.2.1 www.`$d `$marker" }
+`$prefixes=@('www','m','mobile','app','apps','my','go','static','cdn','api','mail','accounts','login','signin','secure','id','auth','download','get')
+foreach(`$x in `$list){
+  `$root = (`$x -replace '^www\.', '')
+  `$lines += "192.0.2.1 `$root `$marker"
+  foreach(`$p in `$prefixes){ `$lines += "192.0.2.1 `$p.`$root `$marker" }
+}
 Set-Content `$hostsFile (`$lines -join "``r``n") -Encoding ascii -Force
 ipconfig /flushdns 2>`$null | Out-Null
 "@
@@ -106,13 +129,18 @@ function Push-BlockedSites-All($domains) {
 # preset list). Used for the per-client "+ Block a site" quick-add, since a
 # scam link is usually only seen by one client at a time.
 function Push-BlockedSite-ToClient($ip, $domain) {
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($domain))
+    $domain = $domain -replace '^www\.', ''
+    $final = Resolve-FinalDomain $domain
+    $allDomains = @($domain)
+    if ($final -and $final -ne $domain) { $allDomains += $final }
+    $joined = ($allDomains -join "`n")
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($joined))
     $ps = @"
 `$dir='C:\ProgramData\RemoteSupport'; New-Item `$dir -ItemType Directory -Force | Out-Null
 `$f=Join-Path `$dir 'blocked-sites.txt'
-`$d=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64')).Trim()
+`$new=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64')) -split "``n" | Where-Object { `$_ }
 `$cur=@(); if(Test-Path `$f){ `$cur=@(Get-Content `$f | ForEach-Object { `$_.Trim() } | Where-Object { `$_ -and `$_ -notmatch '^#' }) }
-`$list=@((`$cur + `$d) | Select-Object -Unique)
+`$list=@((`$cur + `$new) | Select-Object -Unique)
 Set-Content `$f (`$list -join "``r``n") -Encoding ascii
 foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
   Remove-Item "HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist" -Recurse -Force -EA SilentlyContinue
@@ -123,12 +151,17 @@ foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
 `$marker='# RemoteSupport-blocklist'
 try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
 `$lines=@((`$hc -split "``r?``n") | Where-Object { `$_ -notmatch [regex]::Escape(`$marker) })
-foreach(`$x in `$list){ `$lines += "192.0.2.1 `$x `$marker"; `$lines += "192.0.2.1 www.`$x `$marker" }
+`$prefixes=@('www','m','mobile','app','apps','my','go','static','cdn','api','mail','accounts','login','signin','secure','id','auth','download','get')
+foreach(`$x in `$list){
+  `$root = (`$x -replace '^www\.', '')
+  `$lines += "192.0.2.1 `$root `$marker"
+  foreach(`$p in `$prefixes){ `$lines += "192.0.2.1 `$p.`$root `$marker" }
+}
 Set-Content `$hostsFile (`$lines -join "``r``n") -Encoding ascii -Force
 ipconfig /flushdns 2>`$null | Out-Null
 "@
     SSH-Fire $ip ('powershell -NoProfile -EncodedCommand ' + (Enc $ps))
-    Add-ClientSite $ip $domain
+    foreach ($d in $allDomains) { Add-ClientSite $ip $d }
 }
 # Removes a domain from ONE client's blocked list - rewrites its blocked-sites.txt
 # and hosts entries without that domain, and drops it from the dashboard-side tracker.
@@ -145,7 +178,12 @@ Set-Content `$f (`$list -join "``r``n") -Encoding ascii
 `$marker='# RemoteSupport-blocklist'
 try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
 `$lines=@((`$hc -split "``r?``n") | Where-Object { `$_ -notmatch [regex]::Escape(`$marker) })
-foreach(`$x in `$list){ `$lines += "192.0.2.1 `$x `$marker"; `$lines += "192.0.2.1 www.`$x `$marker" }
+`$prefixes=@('www','m','mobile','app','apps','my','go','static','cdn','api','mail','accounts','login','signin','secure','id','auth','download','get')
+foreach(`$x in `$list){
+  `$root = (`$x -replace '^www\.', '')
+  `$lines += "192.0.2.1 `$root `$marker"
+  foreach(`$p in `$prefixes){ `$lines += "192.0.2.1 `$p.`$root `$marker" }
+}
 Set-Content `$hostsFile (`$lines -join "``r``n") -Encoding ascii -Force
 ipconfig /flushdns 2>`$null | Out-Null
 "@
@@ -1489,9 +1527,17 @@ async function clientBlockSite(){
 }
 async function loadClientSites(){
   const box=document.getElementById('csList'); if(!box||!sel)return;
+  const myIp=sel.ip;
   box.textContent='Loading...';
-  let domains=[];
-  try{const r=await fetch('/api/clientsitesget?ip='+sel.ip);domains=(await r.json()).domains||[];}catch(e){}
+  let domains=[], failed=false;
+  try{
+    const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(),6000);
+    const r=await fetch('/api/clientsitesget?ip='+myIp,{signal:ctrl.signal,cache:'no-store'});
+    clearTimeout(t);
+    domains=(await r.json()).domains||[];
+  }catch(e){ failed=true; }
+  if(!sel||sel.ip!==myIp)return; // client was switched while this was loading
+  if(failed){ box.innerHTML='Could not load (dashboard may still be restarting). <button class="rn" style="margin:0;padding:3px 10px" onclick="loadClientSites()">Retry</button>'; return; }
   if(!domains.length){ box.textContent='No sites quick-blocked on this client yet.'; return; }
   box.innerHTML=domains.map(d=>'<div style="display:flex;align-items:center;justify-content:space-between;padding:3px 0">'
     +'<span style="font-family:monospace">'+d.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</span>'

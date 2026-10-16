@@ -322,7 +322,14 @@ if (Test-Path $bsFile) {
     $marker = '# RemoteSupport-blocklist'
     try { $hc = Get-Content $hostsFile -Raw -EA Stop } catch { $hc = '' }
     $hlines = @(($hc -split "`r?`n") | Where-Object { $_ -notmatch [regex]::Escape($marker) })
-    foreach ($d in $domains) { $hlines += "192.0.2.1 $d $marker"; $hlines += "192.0.2.1 www.$d $marker" }
+    # Hosts file can't wildcard-match *.domain.com, so cover the common subdomain
+    # patterns scam/brand sites actually use explicitly instead of just www.
+    $bsPrefixes = @('www','m','mobile','app','apps','my','go','static','cdn','api','mail','accounts','login','signin','secure','id','auth','download','get')
+    foreach ($d in $domains) {
+      $root = ($d -replace '^www\.', '')
+      $hlines += "192.0.2.1 $root $marker"
+      foreach ($p in $bsPrefixes) { $hlines += "192.0.2.1 $p.$root $marker" }
+    }
     Set-Content $hostsFile ($hlines -join "`r`n") -Encoding ascii -Force -EA 0
     ipconfig /flushdns 2>$null | Out-Null
   }
