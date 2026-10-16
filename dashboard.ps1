@@ -75,18 +75,29 @@ function Remove-ClientSite($ip, $domain) {
 # the real destination. Runs HERE on the dashboard PC (which has real internet access,
 # unlike the client script which only runs local commands) and follows redirects to
 # find where the domain actually lands, so that gets blocked too.
+# The dashboard handles one HTTP request at a time (no threading), so a slow/hanging
+# network call here would freeze the WHOLE dashboard for everyone until it gives up -
+# TimeoutSec alone doesn't reliably bound a stuck TCP connect, so this runs as a
+# background job with a hard wall-clock cap instead.
 function Resolve-FinalDomain($domain) {
-    foreach ($scheme in @('https','http')) {
-        try {
-            $resp = Invoke-WebRequest -Uri "$scheme`://$domain" -MaximumRedirection 10 -UseBasicParsing -TimeoutSec 6 -EA Stop
-            $finalHost = ([Uri]$resp.BaseResponse.ResponseUri).Host
-            if ($finalHost) { return ($finalHost -replace '^www\.', '') }
-        } catch {
-            try { $finalHost = ([Uri]$_.Exception.Response.ResponseUri).Host } catch { $finalHost = $null }
-            if ($finalHost) { return ($finalHost -replace '^www\.', '') }
+    $job = Start-Job -ScriptBlock {
+        param($d)
+        foreach ($scheme in @('https','http')) {
+            try {
+                $resp = Invoke-WebRequest -Uri "$scheme`://$d" -MaximumRedirection 10 -UseBasicParsing -TimeoutSec 3 -EA Stop
+                $h = ([Uri]$resp.BaseResponse.ResponseUri).Host
+                if ($h) { return ($h -replace '^www\.', '') }
+            } catch {
+                try { $h = ([Uri]$_.Exception.Response.ResponseUri).Host } catch { $h = $null }
+                if ($h) { return ($h -replace '^www\.', '') }
+            }
         }
-    }
-    return $null
+        return $null
+    } -ArgumentList $domain
+    $done = Wait-Job $job -Timeout 4
+    $result = if ($done) { Receive-Job $job } else { $null }
+    Remove-Job $job -Force -EA SilentlyContinue
+    return $result
 }
 # Pushes the current blocked-sites list to a client immediately over SSH (Chrome/Edge
 # policy registry + hosts-file fallback). update.ps1 also re-applies this every 15 min
