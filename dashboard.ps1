@@ -98,11 +98,17 @@ function Push-BlockedSites-To($ip, $domains) {
 `$dir='C:\ProgramData\RemoteSupport'; New-Item `$dir -ItemType Directory -Force | Out-Null
 `$list=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$b64')) -split "``n" | Where-Object { `$_ }
 Set-Content (Join-Path `$dir 'blocked-sites.txt') (`$list -join "``r``n") -Encoding ascii
-foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
+foreach(`$browser in @('Google\Chrome','Microsoft\Edge','BraveSoftware\Brave','Vivaldi','Chromium')){
   Remove-Item "HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist" -Recurse -Force -EA SilentlyContinue
   New-Item "HKLM:\SOFTWARE\Policies\`$browser" -Force -EA SilentlyContinue | Out-Null
   New-ItemProperty "HKLM:\SOFTWARE\Policies\`$browser" -Name 'DnsOverHttpsMode' -Value 'off' -PropertyType String -Force -EA SilentlyContinue | Out-Null
 }
+# Firefox isn't Chromium - its Secure DNS policy is a different registry shape, and it
+# also reads HKLM Group Policy keys directly (no admin template install needed). Setting
+# this now means it's already in effect the moment a client installs Firefox later.
+New-Item "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS" -Force -EA SilentlyContinue | Out-Null
+New-ItemProperty "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS" -Name 'Enabled' -Value 0 -PropertyType DWord -Force -EA SilentlyContinue | Out-Null
+New-ItemProperty "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS" -Name 'Locked' -Value 1 -PropertyType DWord -Force -EA SilentlyContinue | Out-Null
 `$hostsFile="`$env:windir\System32\drivers\etc\hosts"
 `$marker='# RemoteSupport-blocklist'
 try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
@@ -142,11 +148,17 @@ function Push-BlockedSite-ToClient($ip, $domain) {
 `$cur=@(); if(Test-Path `$f){ `$cur=@(Get-Content `$f | ForEach-Object { `$_.Trim() } | Where-Object { `$_ -and `$_ -notmatch '^#' }) }
 `$list=@((`$cur + `$new) | Select-Object -Unique)
 Set-Content `$f (`$list -join "``r``n") -Encoding ascii
-foreach(`$browser in @('Google\Chrome','Microsoft\Edge')){
+foreach(`$browser in @('Google\Chrome','Microsoft\Edge','BraveSoftware\Brave','Vivaldi','Chromium')){
   Remove-Item "HKLM:\SOFTWARE\Policies\`$browser\URLBlocklist" -Recurse -Force -EA SilentlyContinue
   New-Item "HKLM:\SOFTWARE\Policies\`$browser" -Force -EA SilentlyContinue | Out-Null
   New-ItemProperty "HKLM:\SOFTWARE\Policies\`$browser" -Name 'DnsOverHttpsMode' -Value 'off' -PropertyType String -Force -EA SilentlyContinue | Out-Null
 }
+# Firefox isn't Chromium - its Secure DNS policy is a different registry shape, and it
+# also reads HKLM Group Policy keys directly (no admin template install needed). Setting
+# this now means it's already in effect the moment a client installs Firefox later.
+New-Item "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS" -Force -EA SilentlyContinue | Out-Null
+New-ItemProperty "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS" -Name 'Enabled' -Value 0 -PropertyType DWord -Force -EA SilentlyContinue | Out-Null
+New-ItemProperty "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS" -Name 'Locked' -Value 1 -PropertyType DWord -Force -EA SilentlyContinue | Out-Null
 `$hostsFile="`$env:windir\System32\drivers\etc\hosts"
 `$marker='# RemoteSupport-blocklist'
 try{ `$hc=Get-Content `$hostsFile -Raw -EA Stop }catch{ `$hc='' }
