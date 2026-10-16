@@ -288,6 +288,16 @@ function JEsc($s) {
     }
     return $sb.ToString()
 }
+# ConvertTo-Json collapses a 1-element array into a bare string instead of a JSON
+# array (a long-standing Windows PowerShell 5.1 quirk, same root cause as the one
+# documented on Get-AppScan below) - domains.map(...) in the browser then throws on
+# that string and the blocked-sites panel is left stuck on "Loading..." forever.
+# Builds the JSON by hand so it's ALWAYS a real array, 0, 1 or many domains.
+function Domains-Json($output, $domains) {
+    $arr = '[' + (((@($domains)) | ForEach-Object { '"' + (JEsc $_) + '"' }) -join ',') + ']'
+    if ($null -ne $output) { return '{"output":"' + (JEsc $output) + '","domains":' + $arr + '}' }
+    return '{"domains":' + $arr + '}'
+}
 # Reverses JEsc - turns a JSON string literal's contents (as captured by the regex in
 # Get-AppScan) back into the real text. Paired with JEsc instead of ConvertFrom-Json
 # because ConvertFrom-Json itself was the actual bug (see Get-AppScan).
@@ -1997,15 +2007,15 @@ while ($true) {
             # usually sees its own unique scam link.
             $b = Body $ctx
             Push-BlockedSite-ToClient $b.ip $b.domain
-            Send $ctx (@{ output = "Blocked '$($b.domain)' on this client."; domains = (Get-ClientSites $b.ip) } | ConvertTo-Json -Compress) 'application/json'
+            Send $ctx (Domains-Json "Blocked '$($b.domain)' on this client." (Get-ClientSites $b.ip)) 'application/json'
         }
         elseif ($path -eq '/api/clientsitesget') {
-            $ip = $ctx.Request.QueryString['ip']; Send $ctx (@{ domains = (Get-ClientSites $ip) } | ConvertTo-Json -Compress) 'application/json'
+            $ip = $ctx.Request.QueryString['ip']; Send $ctx (Domains-Json $null (Get-ClientSites $ip)) 'application/json'
         }
         elseif ($path -eq '/api/clientsiteremove') {
             $b = Body $ctx
             Unblock-ClientSite $b.ip $b.domain
-            Send $ctx (@{ output = "Unblocked '$($b.domain)' on this client."; domains = (Get-ClientSites $b.ip) } | ConvertTo-Json -Compress) 'application/json'
+            Send $ctx (Domains-Json "Unblocked '$($b.domain)' on this client." (Get-ClientSites $b.ip)) 'application/json'
         }
         elseif ($path -eq '/api/blockedsitesset') {
             $b = Body $ctx
