@@ -1829,9 +1829,15 @@ async function checkAutoSilent(){
   if(!sel||!document.getElementById('asBadge'))return;
   try{const r=await fetch('/api/autosilentget?ip='+sel.ip);paintAutoSilent((await r.json()).active||'off');}catch(e){}
 }
-let deadHits=0;
+let deadHits=0, myBuild=null;
 async function ping(){
-  try{await fetch('/api/heartbeat',{cache:'no-store'});deadHits=0;}
+  try{
+    const r=await fetch('/api/heartbeat',{cache:'no-store'});
+    const j=await r.json();
+    deadHits=0;
+    if(myBuild===null){ myBuild=j.build; }
+    else if(j.build && j.build!==myBuild){ location.reload(); }
+  }
   catch(e){deadHits++;if(deadHits>=2)showDead();}
 }
 function showDead(){
@@ -1889,6 +1895,13 @@ for ($i = 0; $i -lt 5 -and -not $started; $i++) {
 # port 8760), which is what made the dashboard get stuck instead of actually restarting.
 $selfPath = $PSCommandPath
 $selfWriteTime = (Get-Item $selfPath -EA SilentlyContinue).LastWriteTime
+# Sent back on every heartbeat so the browser tab can tell THIS backend process apart
+# from whatever process answers after a self-restart - without this, a restart that
+# happens to be faster than 2 missed 3s-interval heartbeats (deadHits>=2) never shows
+# the "Reconnecting..." screen, and the open tab is left silently running the OLD
+# cached JS forever even though the backend already has the new code. Comparing build
+# ids on every poll catches a restart regardless of how short the gap was.
+$buildId = if ($selfWriteTime) { [string]$selfWriteTime.Ticks } else { [string](Get-Random) }
 $selfRestartFlag = "$env:TEMP\rs-dash-selfrestart.flag"
 if (-not $started) { Write-Host "Could not start on $prefix after several tries - another program may be holding port $port."; exit }
 Write-Host "Dashboard running at $prefix   (close this window to stop)"
@@ -1951,7 +1964,7 @@ while ($true) {
     try {
         if ($path -eq '/') { Send $ctx $html }
         elseif ($path -eq '/api/clients') { Send $ctx ((Get-Clients | ConvertTo-Json -Compress)) 'application/json' }
-        elseif ($path -eq '/api/heartbeat') { Send $ctx (@{ locked = (Heartbeat) } | ConvertTo-Json -Compress) 'application/json' }
+        elseif ($path -eq '/api/heartbeat') { Send $ctx (@{ locked = (Heartbeat); build = $buildId } | ConvertTo-Json -Compress) 'application/json' }
         elseif ($path -eq '/api/action') {
             $b = Body $ctx; Send $ctx (@{ output = (Do-Action $b.ip $b.action) } | ConvertTo-Json -Compress) 'application/json'
         }
