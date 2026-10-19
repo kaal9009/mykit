@@ -1,9 +1,10 @@
 # ===== Remote-support-kit health audit =====
-# Daily mode (scheduled task, no args): checks the whole kit, and ONLY if something is wrong
-#   sends Rohit a Telegram message first - never fixes anything by itself, stays silent on a
-#   clean day.
-# Manual mode (run with -Manual): always produces a FULL report (clean items too), sends it
-#   to Telegram, and writes it to audit-report.txt so it can be read back and shown in chat.
+# Daily mode (scheduled task, no args): checks the whole kit and logs to audit-log.txt -
+#   never fixes anything by itself, stays silent on a clean day. Telegram push disabled
+#   per Rohit's request (Oct 19 2026) - he doesn't want this "report" noise on Telegram,
+#   only the local log/file stay.
+# Manual mode (run with -Manual): always produces a FULL report (clean items too) and
+#   writes it to audit-report.txt so it can be read back and shown in chat.
 param([switch]$Manual)
 $ErrorActionPreference = 'SilentlyContinue'
 $base       = 'C:\Users\rohit\Downloads\CONECTTTTTT'
@@ -54,13 +55,11 @@ if ($raw) {
 }
 if (-not $clients.Count) { $issues += 'Tailscale returned no clients (Tailscale may be down/logged out on this PC).' }
 
-# 4) Which known clients are unreachable right now, and - from the first reachable one -
-#    pick up the Telegram bot token/chat id it already carries (pushed earlier via "ua"),
-#    so this script needs no secret of its own and nothing new to configure.
+# 4) Which known clients are unreachable right now, and scan each reachable one's
+#    heal-log.txt for errors.
 $names = @{}
 if (Test-Path $namesFile) { Get-Content $namesFile | ForEach-Object { if ($_ -match '^(.+?)=(.+)$') { $names[$matches[1].Trim().ToUpper()] = $matches[2].Trim() } } }
 $down = @(); $up = @()
-$tgToken = $null; $tgChat = $null
 $logIssues = @()
 foreach ($c in $clients) {
     $friendly = if ($names.ContainsKey($c.host.ToUpper())) { $names[$c.host.ToUpper()] } else { $c.host }
@@ -68,16 +67,6 @@ foreach ($c in $clients) {
     $up += $friendly
     $u = Login-For $c.ip
     $sshOpts = @('-o','StrictHostKeyChecking=no','-o','BatchMode=yes','-o','ConnectTimeout=5')
-    if (-not $tgToken) {
-        try {
-            $r = & ssh @sshOpts "$u@$($c.ip)" 'powershell -NoProfile -Command "if(Test-Path C:\ProgramData\RemoteSupport\tg.txt){Get-Content C:\ProgramData\RemoteSupport\tg.txt -Raw}"' 2>$null
-            foreach ($l in (($r | Out-String) -split "`n")) {
-                if ($l -match '^token=(.+)$') { $tgToken = $matches[1].Trim() }
-                elseif ($l -match '^chat=(.+)$') { $tgChat = $matches[1].Trim() }
-            }
-        } catch {}
-    }
-    # 5) scan today's heal-log.txt on this client for anything logged as an error
     try {
         $log = & ssh @sshOpts "$u@$($c.ip)" 'powershell -NoProfile -Command "if(Test-Path C:\ProgramData\RemoteSupport\heal-log.txt){Get-Content C:\ProgramData\RemoteSupport\heal-log.txt -Tail 40}"' 2>$null
         $today = (Get-Date).ToString('yyyy-MM-dd')
@@ -91,31 +80,22 @@ if ($clients.Count) { $ok += ("Clients: " + $clients.Count + " total, " + $up.Co
 if ($clients.Count -and -not $logIssues.Count) { $ok += 'No errors logged on any online client today.' }
 
 $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
-function Send-TG($text) {
-    if ($tgToken -and $tgChat) {
-        try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$tgToken/sendMessage" -Body @{ chat_id = $tgChat; text = $text } | Out-Null; return $true } catch { return $false }
-    }
-    return $false
-}
 
 if ($Manual) {
-    # Full report always, whether clean or not.
+    # Full report always, whether clean or not. File + chat-readback only, no Telegram.
     $head = if ($issues.Count) { "Kit audit ($stamp) - $($issues.Count) ISSUE(S) FOUND:" } else { "Kit audit ($stamp) - ALL CLEAR, no issues:" }
     $lines = @($head)
     if ($issues.Count) { $lines += ''; $lines += 'PROBLEMS:'; foreach ($i in $issues) { $lines += "  - $i" } }
     $lines += ''; $lines += 'CHECKED OK:'; foreach ($o in $ok) { $lines += "  - $o" }
     $lines += ''; $lines += '(Manual audit - nothing was changed, checked only.)'
     $report = ($lines -join "`n")
-    $sent = Send-TG $report
-    Set-Content -Path $reportFile -Value ($report + "`n`nTelegram sent: $sent") -Encoding UTF8
-    Add-Content $logFile ("$stamp MANUAL audit (telegram sent: $sent): " + $(if($issues.Count){'ISSUES - ' + ($issues -join ' | ')}else{'clean'}))
+    Set-Content -Path $reportFile -Value $report -Encoding UTF8
+    Add-Content $logFile ("$stamp MANUAL audit: " + $(if($issues.Count){'ISSUES - ' + ($issues -join ' | ')}else{'clean'}))
 }
 else {
-    # Daily mode: only speak up on problems.
+    # Daily mode: log only, no Telegram push - Rohit asked this report stay off Telegram.
     if ($issues.Count) {
-        $msg = "Remote-support-kit daily audit found an issue:`n- " + ($issues -join "`n- ") + "`n(Nothing was changed automatically - checked only.)"
-        $sent = Send-TG $msg
-        Add-Content $logFile ("$stamp ISSUES (telegram sent: $sent): " + ($issues -join ' | '))
+        Add-Content $logFile ("$stamp ISSUES: " + ($issues -join ' | '))
     } else {
         Add-Content $logFile ("$stamp clean - no issues found.")
     }
